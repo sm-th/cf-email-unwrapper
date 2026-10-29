@@ -1,7 +1,5 @@
 """A2A v1.0 JSON-RPC client for the agent, built on the a2a-sdk transport."""
 
-from typing import Any
-
 import httpx
 from a2a.client.transports.jsonrpc import JsonRpcTransport
 from a2a.types.a2a_pb2 import (
@@ -33,7 +31,6 @@ class AgentClient:
         text: str,
         message_id: str,
         context_id: str,
-        metadata: dict[str, Any],
         push_url: str,
         push_token: str,
     ) -> SendMessageResponse:
@@ -43,7 +40,6 @@ class AgentClient:
             role=Role.ROLE_USER,
             parts=[Part(text=text)],
         )
-        message.metadata.update(metadata)
         request = SendMessageRequest(
             message=message,
             configuration=SendMessageConfiguration(

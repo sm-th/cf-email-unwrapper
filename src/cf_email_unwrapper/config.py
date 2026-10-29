@@ -53,6 +53,7 @@ class Config:
     max_signature_age: float
     poll_interval: float
     openssl: str
+    state_path: str
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -65,6 +66,10 @@ class Config:
             return value
 
         account_id = required("CF_ACCOUNT_ID")
+        agent_address = required("AGENT_ADDRESS").lower()
+        state_home = env.get("XDG_STATE_HOME") or os.path.join(
+            env.get("HOME") or os.path.expanduser("~"), ".local", "state"
+        )
         push_host = env.get("PUSH_HOST", "127.0.0.1")
         push_port = int(env.get("PUSH_PORT", "8090"))
         url_host = "127.0.0.1" if push_host in ("0.0.0.0", "::") else push_host
@@ -75,7 +80,7 @@ class Config:
             r2_access_key_id=required("R2_ACCESS_KEY_ID"),
             r2_secret_access_key=required("R2_SECRET_ACCESS_KEY"),
             r2_bucket=env.get("R2_BUCKET") or "email-agents",
-            agent_address=required("AGENT_ADDRESS").lower(),
+            agent_address=agent_address,
             bot_key_pem=normalize_pem(required("BOT_KEY")),
             bot_cert_pem=normalize_pem(required("BOT_CERT")),
             ca_cert_pem=normalize_pem(required("CA_CERT")),
@@ -92,4 +97,6 @@ class Config:
             max_signature_age=parse_duration(env.get("MAX_SIGNATURE_AGE") or "1h"),
             poll_interval=parse_duration(env.get("POLL_INTERVAL") or "5"),
             openssl=env.get("OPENSSL") or "openssl",
+            state_path=env.get("STATE_PATH")
+            or os.path.join(state_home, "cf-email-unwrapper", f"{agent_address}.sqlite3"),
         )

@@ -7,11 +7,11 @@ import logging
 from typing import Any
 
 from a2a.types.a2a_pb2 import Message, Task, TaskState
-from google.protobuf.json_format import MessageToDict
 
 from .cloudflare import CloudflareError, Queues
 from .mail import compose_reply, text_entity
 from .smime import Smime
+from .state import Mail, State
 
 log = logging.getLogger(__name__)
 
@@ -27,14 +27,8 @@ REPLY_STATES: dict[int, bool] = {
 # A queue message is limited to 128 KB; leave room for the envelope.
 MAX_OUTBOX_JSON = 120_000
 
-
-def email_metadata(task: Task) -> dict[str, Any] | None:
-    """The ``email`` metadata of the newest user message in the task history."""
-    for message in reversed(task.history):
-        meta = MessageToDict(message.metadata).get("email")
-        if meta:
-            return meta
-    return MessageToDict(task.metadata).get("email") or None
+# Input-required can still be followed by another state; the others end the task.
+NON_FINAL_REPLY_STATES = {TaskState.TASK_STATE_INPUT_REQUIRED}
 
 
 def _message_text(message: Message) -> str:
@@ -55,65 +49,67 @@ def agent_text(task: Task) -> str:
 
 
 class Replier:
-    def __init__(self, *, queues: Queues, outbox_queue: str, smime: Smime, agent_address: str):
+    def __init__(
+        self, *, queues: Queues, outbox_queue: str, smime: Smime, agent_address: str, state: State
+    ):
         self._queues = queues
         self._outbox_queue = outbox_queue
         self._outbox_id: str | None = None
         self._smime = smime
         self._agent_address = agent_address
-        self._replied: set[tuple[str, int]] = set()
+        self._state = state
         self._lock = asyncio.Lock()
 
     async def reply_to_task(self, task: Task) -> None:
         state = task.status.state
         if state not in REPLY_STATES:
             return
-        key = (task.id, state)
         async with self._lock:
-            if key in self._replied:
+            if self._state.replied(task.id, state):
                 log.info("task %s already answered in state %s", task.id, TaskState.Name(state))
                 return
-            meta = email_metadata(task)
-            if meta is None:
-                log.error("task %s has no email metadata in its history; cannot reply", task.id)
+            mail = self._state.mail_for_task(task.id)
+            if mail is None:
+                log.error("task %s was not submitted by this unwrapper; cannot reply", task.id)
                 return
             text = agent_text(task) or (
                 f"The agent finished without a text answer ({TaskState.Name(state)})."
             )
-            await self.reply(meta, text, urgent=REPLY_STATES[state])
-            self._replied.add(key)
+            await self.reply(mail, text, urgent=REPLY_STATES[state])
+            self._state.record_reply(task.id, state, final=state not in NON_FINAL_REPLY_STATES)
 
-    async def reply_to_message(self, message: Message, meta: dict[str, Any]) -> None:
+    async def reply_to_message(self, message: Message, mail: Mail) -> None:
         """Reply for an agent that answered SendMessage with a direct message."""
-        await self.reply(meta, _message_text(message), urgent=False)
+        await self.reply(mail, _message_text(message), urgent=False)
+        self._state.close_mail(mail.message_id)
 
-    async def reply(self, meta: dict[str, Any], text: str, *, urgent: bool) -> None:
-        body = await asyncio.to_thread(self._outbox_body, meta, text, urgent)
+    async def reply(self, mail: Mail, text: str, *, urgent: bool) -> None:
+        body = await asyncio.to_thread(self._outbox_body, mail, text, urgent)
         if len(json.dumps(body)) > MAX_OUTBOX_JSON:
-            log.warning("reply to %s is too large for the outbox; sending a notice", meta["author"])
+            log.warning("reply to %s is too large for the outbox; sending a notice", mail.author)
             notice = (
                 "The agent's answer is too large to be delivered by email "
                 f"({len(text.encode())} bytes of text)."
             )
-            body = await asyncio.to_thread(self._outbox_body, meta, notice, True)
+            body = await asyncio.to_thread(self._outbox_body, mail, notice, True)
         await self._queues.push(await self._outbox_queue_id(), body)
-        log.info("reply to %s queued (%s)", meta["author"], meta.get("messageId"))
+        log.info("reply to %s queued (%s)", mail.author, mail.message_id)
 
-    def _outbox_body(self, meta: dict[str, Any], text: str, urgent: bool) -> dict[str, Any]:
-        sealed = self._smime.seal(text_entity(text), meta.get("replyCertPem"))
+    def _outbox_body(self, mail: Mail, text: str, urgent: bool) -> dict[str, Any]:
+        sealed = self._smime.seal(text_entity(text), mail.reply_cert_pem)
         raw = compose_reply(
             sealed,
             agent_address=self._agent_address,
-            author=meta["author"],
-            subject=meta.get("subject", ""),
-            parent_message_id=meta["messageId"],
-            parent_references=meta.get("references", ""),
+            author=mail.author,
+            subject=mail.subject,
+            parent_message_id=mail.message_id,
+            parent_references=mail.references,
             urgent=urgent,
         )
         return {
             "version": 1,
             "from": self._agent_address,
-            "to": meta["author"],
+            "to": mail.author,
             "raw": base64.b64encode(raw).decode(),
         }
 

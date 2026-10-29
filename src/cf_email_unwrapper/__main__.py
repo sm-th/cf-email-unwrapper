@@ -1,6 +1,7 @@
 """Entry point: ``python -m cf_email_unwrapper``."""
 
 import asyncio
+import contextlib
 import logging
 
 import uvicorn
@@ -12,6 +13,7 @@ from .push import create_app
 from .r2 import R2Store
 from .replier import Replier
 from .smime import Smime
+from .state import State
 from .worker import Worker
 
 
@@ -25,8 +27,13 @@ async def main() -> None:
         ca_pem=cfg.ca_cert_pem,
     )
     agent = AgentClient(cfg.a2a_url, cfg.a2a_token)
+    state = State(cfg.state_path)
     replier = Replier(
-        queues=queues, outbox_queue=cfg.outbox_queue, smime=smime, agent_address=cfg.agent_address
+        queues=queues,
+        outbox_queue=cfg.outbox_queue,
+        smime=smime,
+        agent_address=cfg.agent_address,
+        state=state,
     )
     store = R2Store(
         endpoint=cfg.r2_endpoint,
@@ -35,7 +42,13 @@ async def main() -> None:
         bucket=cfg.r2_bucket,
     )
     worker = Worker(
-        config=cfg, queues=queues, store=store, smime=smime, agent=agent, replier=replier
+        config=cfg,
+        queues=queues,
+        store=store,
+        smime=smime,
+        agent=agent,
+        replier=replier,
+        state=state,
     )
     server = uvicorn.Server(
         uvicorn.Config(
@@ -51,6 +64,9 @@ async def main() -> None:
         await server.serve()
     finally:
         worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+        state.close()
 
 
 if __name__ == "__main__":

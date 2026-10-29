@@ -14,6 +14,7 @@ from cf_email_unwrapper.cloudflare import Queues
 from cf_email_unwrapper.config import Config
 from cf_email_unwrapper.push import TOKEN_HEADER, create_app
 from cf_email_unwrapper.replier import Replier
+from cf_email_unwrapper.state import State
 from cf_email_unwrapper.worker import Worker
 
 INBOUND_ID, OUTBOX_ID = "q-inbound", "q-outbox"
@@ -109,31 +110,39 @@ class FakeR2:
 PUSH_TOKEN = "stable-push-secret"
 
 
-def start_unwrapper(pki, cf, agent, r2, **env):
-    """One unwrapper process: fresh Config, clients, replier state and push app."""
+def start_unwrapper(pki, cf, agent, r2, state_path, **env):
+    """One unwrapper process: fresh Config, clients, state connection and push app."""
     config = Config.from_env({
         "CF_ACCOUNT_ID": "acct", "CF_API_TOKEN": "cf-token", "R2_ENDPOINT": "http://r2",
         "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s", "AGENT_ADDRESS": BOT,
         "BOT_KEY": pki.bot.key_pem, "BOT_CERT": pki.bot.cert_pem, "CA_CERT": pki.ca.cert_pem,
         "ALLOWED_SENDERS": AUTHOR, "A2A_URL": "http://agent/", "A2A_TOKEN": "a2a-token",
         "PUSH_URL": PUSH_URL, "PUSH_TOKEN": PUSH_TOKEN, "POLL_INTERVAL": "0.01",
-        "OPENSSL": OPENSSL, **env,
+        "OPENSSL": OPENSSL, "STATE_PATH": str(state_path), **env,
     })
     queues = Queues("acct", "cf-token", httpx.AsyncClient(transport=httpx.MockTransport(cf.handler)))
     a2a = AgentClient(config.a2a_url, config.a2a_token,
                       httpx.AsyncClient(transport=httpx.MockTransport(agent.handler)))
     smime = pki.smime()
-    replier = Replier(queues=queues, outbox_queue="email-outbox", smime=smime, agent_address=BOT)
-    worker = Worker(config=config, queues=queues, store=r2, smime=smime, agent=a2a, replier=replier)
+    state = State(config.state_path)
+    replier = Replier(queues=queues, outbox_queue="email-outbox", smime=smime, agent_address=BOT,
+                      state=state)
+    worker = Worker(config=config, queues=queues, store=r2, smime=smime, agent=a2a,
+                    replier=replier, state=state)
     app = create_app(token=config.push_token, agent=a2a, replier=replier)
     push = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://push")
     return config, worker, push
 
 
 @pytest.fixture
-def bridge(pki):
+def state_path(tmp_path):
+    return tmp_path / "state" / "hermes.sqlite3"
+
+
+@pytest.fixture
+def bridge(pki, state_path):
     cf, agent, r2 = FakeCloudflare(), FakeAgent(), FakeR2()
-    config, worker, push = start_unwrapper(pki, cf, agent, r2)
+    config, worker, push = start_unwrapper(pki, cf, agent, r2, state_path)
     return cf, agent, r2, config, worker, push
 
 
@@ -158,9 +167,7 @@ async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     message, configuration = send["params"]["message"], send["params"]["configuration"]
     assert message["role"] == "ROLE_USER"
     assert message["parts"] == [{"text": "What is the weather?"}]
-    email_meta = message["metadata"]["email"]
-    assert email_meta["author"] == AUTHOR and email_meta["messageId"] == "<q1@example.com>"
-    assert "BEGIN CERTIFICATE" in email_meta["replyCertPem"]
+    assert "metadata" not in message  # the email context stays in the unwrapper
     assert configuration["returnImmediately"] is True
     assert configuration["taskPushNotificationConfig"] == {"url": PUSH_URL, "token": config.push_token}
     # Accepted: acknowledged and removed from R2, nothing replied yet.
@@ -188,25 +195,47 @@ async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     assert b"Sunny." in content
 
 
-async def test_reply_survives_a_restart_with_the_same_push_token(pki, bridge):
+async def test_task_finished_while_down_is_answered_once_after_restart(pki, bridge, state_path):
     cf, agent, r2, _, worker, _ = bridge
-    deliver(cf, r2, pki.seal("Long job", signer=pki.author_sign, headers=mail_headers()), "k.eml")
+    raw = pki.seal("Long job", signer=pki.author_sign, extra_certs=[pki.author_enc],
+                   headers=mail_headers(**{"Message-ID": "<long@example.com>"}))
+    deliver(cf, r2, raw, "k.eml")
     await worker.poll_once(INBOUND_ID)
-    [send] = agent.requests
-    assert send["params"]["configuration"]["taskPushNotificationConfig"]["token"] == PUSH_TOKEN
+    await worker.recover()  # still running: nothing to answer
+    assert cf.outbox == []
 
-    # The process restarts before the agent finishes: new Config, replier state and app.
-    _, _, restarted_push = start_unwrapper(pki, cf, agent, r2)
+    # The agent finishes while the unwrapper is down, so its notification is lost.
     agent.complete("task-1", "Finished.")
+    _, restarted, restarted_push = start_unwrapper(pki, cf, agent, r2, state_path)
+    await restarted.recover()
+    [outgoing] = cf.outbox
+    reply = base64.b64decode(outgoing["raw"])
+    assert email.message_from_bytes(reply)["In-Reply-To"] == "<long@example.com>"
+    assert b"Finished." in pki.open_reply(reply, recipient=pki.author_enc)
+
+    # A late notification and another restart do not answer again.
     resp = await restarted_push.post(
         "/a2a/push", json={"task": {"id": "task-1"}}, headers={TOKEN_HEADER: PUSH_TOKEN}
     )
     assert resp.status_code == 200
+    _, again, _ = start_unwrapper(pki, cf, agent, r2, state_path)
+    await again.recover()
     assert len(cf.outbox) == 1
+    assert [r["method"] for r in agent.requests].count("GetTask") == 3  # the last recover skips the closed task
 
     with pytest.raises(ValueError, match="PUSH_TOKEN"):
-        start_unwrapper(pki, cf, agent, r2, PUSH_TOKEN="  ")
+        start_unwrapper(pki, cf, agent, r2, state_path, PUSH_TOKEN="  ")
 
+
+async def test_redelivered_mail_reaches_the_agent_once(pki, bridge):
+    cf, agent, r2, _, worker, _ = bridge
+    raw = pki.seal("hi", signer=pki.author_sign, headers=mail_headers())
+    deliver(cf, r2, raw, "first.eml")
+    deliver(cf, r2, raw, "again.eml")  # the queue delivers at least once
+
+    assert await worker.poll_once(INBOUND_ID) == 2
+    assert [r["method"] for r in agent.requests] == ["SendMessage"]
+    assert len(cf.acks) == 2 and r2.objects == {}
 
 
 async def test_unauthenticated_mail_is_dropped_without_reply(pki, bridge):

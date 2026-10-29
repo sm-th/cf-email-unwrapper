@@ -7,6 +7,7 @@ from a2a.types.a2a_pb2 import Artifact, Message, Part, Role, Task, TaskState, Ta
 from conftest import AUTHOR, BOT
 
 from cf_email_unwrapper.replier import Replier
+from cf_email_unwrapper.state import Mail, State
 
 
 class FakeOutbox:
@@ -21,18 +22,21 @@ class FakeOutbox:
         self.pushed.append(body)
 
 
-def make_task(state, *, agent_text="", reply_cert=None, task_id="task-1", artifact_text=""):
-    meta = {
-        "author": AUTHOR,
-        "agentAddress": BOT,
-        "subject": "Grüße aus Berlin",
-        "messageId": "<parent@example.com>",
-        "references": "<root@example.com> <mid@example.com>",
-    }
-    if reply_cert:
-        meta["replyCertPem"] = reply_cert
+def submit(state: State, task_id="task-1", reply_cert=None) -> None:
+    """Record the mail the unwrapper handed to the agent as ``task_id``."""
+    message_id = f"<{task_id}@example.com>" if task_id != "task-1" else "<parent@example.com>"
+    state.record_mail(Mail(
+        message_id=message_id,
+        author=AUTHOR,
+        subject="Grüße aus Berlin",
+        references="<root@example.com> <mid@example.com>",
+        reply_cert_pem=reply_cert,
+    ))
+    state.attach_task(message_id, task_id)
+
+
+def make_task(state, *, agent_text="", task_id="task-1", artifact_text=""):
     user = Message(message_id="m1", role=Role.ROLE_USER, parts=[Part(text="question")])
-    user.metadata.update({"email": meta})
     task = Task(id=task_id, context_id="ctx", history=[user])
     task.status.CopyFrom(TaskStatus(state=state))
     if agent_text:
@@ -50,8 +54,16 @@ def outbox():
 
 
 @pytest.fixture
-def replier(pki, outbox):
-    return Replier(queues=outbox, outbox_queue="email-outbox", smime=pki.smime(), agent_address=BOT)
+def state():
+    state = State(":memory:")
+    yield state
+    state.close()
+
+
+@pytest.fixture
+def replier(pki, outbox, state):
+    return Replier(queues=outbox, outbox_queue="email-outbox", smime=pki.smime(), agent_address=BOT,
+                   state=state)
 
 
 def parse(body):
@@ -59,9 +71,9 @@ def parse(body):
     return raw, email.message_from_bytes(raw, policy=email.policy.default)
 
 
-async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, outbox):
-    task = make_task(TaskState.TASK_STATE_COMPLETED, artifact_text="Die Antwort",
-                     reply_cert=pki.author_enc.cert_pem)
+async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, outbox, state):
+    submit(state, reply_cert=pki.author_enc.cert_pem)
+    task = make_task(TaskState.TASK_STATE_COMPLETED, artifact_text="Die Antwort")
     await replier.reply_to_task(task)
 
     [body] = outbox.pushed
@@ -84,7 +96,9 @@ async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, ou
     assert text.strip() == "Die Antwort"
 
 
-async def test_failure_reply_is_signed_only_without_cert_and_marked_urgent(pki, replier, outbox):
+async def test_failure_reply_is_signed_only_without_cert_and_marked_urgent(pki, replier, outbox,
+                                                                          state):
+    submit(state)
     await replier.reply_to_task(make_task(TaskState.TASK_STATE_FAILED, agent_text="Tool crashed"))
 
     raw, msg = parse(outbox.pushed[0])
@@ -94,26 +108,30 @@ async def test_failure_reply_is_signed_only_without_cert_and_marked_urgent(pki, 
     assert b"Tool crashed" in content
 
 
-async def test_each_task_state_is_answered_once(replier, outbox):
+async def test_each_task_state_is_answered_once(replier, outbox, state):
+    submit(state)
     question = make_task(TaskState.TASK_STATE_INPUT_REQUIRED, agent_text="Which city?")
     await replier.reply_to_task(question)
     await replier.reply_to_task(question)
     assert len(outbox.pushed) == 1
     assert parse(outbox.pushed[0])[1]["Importance"] == "low"
+    assert state.open_tasks() == ["task-1"]  # input-required does not end the task
 
     await replier.reply_to_task(make_task(TaskState.TASK_STATE_COMPLETED, agent_text="Done"))
     assert len(outbox.pushed) == 2
+    assert state.open_tasks() == []
 
 
-async def test_non_final_states_and_tasks_without_email_metadata_are_ignored(replier, outbox):
+async def test_non_final_states_and_unknown_tasks_are_ignored(replier, outbox, state):
+    submit(state)
     await replier.reply_to_task(make_task(TaskState.TASK_STATE_WORKING, agent_text="…"))
-    orphan = make_task(TaskState.TASK_STATE_COMPLETED, agent_text="?")
-    del orphan.history[:]
-    await replier.reply_to_task(orphan)
+    foreign = make_task(TaskState.TASK_STATE_COMPLETED, agent_text="?", task_id="not-ours")
+    await replier.reply_to_task(foreign)
     assert outbox.pushed == []
 
 
-async def test_oversized_answer_becomes_an_urgent_notice(replier, outbox):
+async def test_oversized_answer_becomes_an_urgent_notice(replier, outbox, state):
+    submit(state)
     await replier.reply_to_task(make_task(TaskState.TASK_STATE_COMPLETED, agent_text="x" * 200_000))
     [body] = outbox.pushed
     assert len(body["raw"]) < 120_000

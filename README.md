@@ -43,22 +43,18 @@ S/MIME check. The agent only speaks plain A2A.
 5. Authenticated mail is sent to the agent with A2A `SendMessage` (non-blocking,
    `returnImmediately: true`) with a push notification config pointing to this service's push URL
    and the configured `PUSH_TOKEN`. The message text is the email's `text/plain` body, or its HTML
-   body converted to text. The message carries metadata:
-
-   ```json
-   {"email": {"author": "...", "agentAddress": "...", "subject": "...",
-              "messageId": "<parent Message-ID>", "references": "<parent References>",
-              "replyCertPem": "-----BEGIN CERTIFICATE-----..."}}
-   ```
+   body converted to text; the message carries no email metadata. The email context needed for the
+   reply (author, subject, Message-ID, References, reply certificate) is stored in the local state
+   file under the task id.
 
    Once the agent has accepted the task, the queue message is acknowledged and the R2 object
    deleted. If the agent cannot be reached, the queue message is retried after 30 s and the R2
-   object is kept.
+   object is kept. A redelivered message whose Message-ID the agent already accepted is
+   acknowledged without a second `SendMessage`.
 6. When the agent sends a push notification, the service checks the `X-A2A-Notification-Token`
    header, fetches the task with `GetTask` and replies only for the states `completed`,
-   `input-required`, `failed`, `rejected` and `canceled`. The email metadata is read back from the
-   task history (falling back to task metadata). The reply text is the text of the task's
-   artifacts plus its status message.
+   `input-required`, `failed`, `rejected` and `canceled`, using the email context from the state
+   file. The reply text is the text of the task's artifacts plus its status message.
 7. The reply is signed (detached, SHA-256) with the bot certificate and encrypted with AES-256 for
    the author's reply certificate when one was found (OpenSSL's default ECDH KDF,
    `dhSinglePass-stdDH-sha1kdf-scheme`, which iOS Mail requires). Without a reply certificate the
@@ -67,8 +63,16 @@ S/MIME check. The agent only speaks plain A2A.
    succeeded, otherwise 502 so the agent may retry. Replies whose JSON would exceed 120 KB are
    replaced by a short notice.
 
-Each (task, state) pair is answered at most once per process (in-memory only; there is no
-persistent state).
+Each (task, state) pair is answered at most once, also across restarts. On startup the service
+fetches every task that has not reached a final reply (`completed`, `failed`, `rejected`,
+`canceled`) with `GetTask` and answers those that finished while it was down, so a notification
+lost during downtime does not lose the reply.
+
+### State
+
+One SQLite file per instance (`STATE_PATH`) holds the email context of every mail handed to the
+agent and the replies sent. Keep it on persistent storage; losing it loses the replies for tasks
+still running and the protection against answering twice. Rows are not pruned.
 
 ### Threads and ids
 
@@ -89,10 +93,7 @@ persistent state).
 - Text only: attachments are ignored inbound, and replies are a single `text/plain` part.
 - Every email starts a new A2A task in the thread's context; replies to an `input-required`
   question are not attached to the waiting task.
-- Restarts: `PUSH_TOKEN` is a stable secret, so notifications for tasks submitted before a restart
-  or redeploy are still accepted and answered. The "already answered" set is in memory only, so a
-  notification repeated across a restart can produce a second reply. A notification sent while the
-  service is down is only recovered if the agent retries it.
+- A reply is recorded after it was pushed to the outbox; a crash between the two can send it twice.
 
 ## Queue naming
 
@@ -133,6 +134,7 @@ Environment variables only.
 | `MAX_SIGNATURE_AGE` | no | `1h` | Maximum signingTime age; seconds or `s`/`m`/`h` suffix |
 | `POLL_INTERVAL` | no | `5` | Pause between empty pulls; seconds or `s`/`m`/`h` suffix |
 | `OPENSSL` | no | `openssl` | Path to an OpenSSL 3 binary (LibreSSL is not supported) |
+| `STATE_PATH` | no | `$XDG_STATE_HOME/cf-email-unwrapper/<AGENT_ADDRESS>.sqlite3` (`~/.local/state` without `XDG_STATE_HOME`) | SQLite state file; parent directories are created |
 
 ## Running
 

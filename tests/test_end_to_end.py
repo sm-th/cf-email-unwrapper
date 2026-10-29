@@ -145,7 +145,7 @@ def deliver(cf, r2, raw: bytes, key: str) -> None:
 
 async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     cf, agent, r2, config, worker, push = bridge
-    key = "inbox/mail-hermes-example-org/1.eml"
+    key = "mail-hermes-example-org/1.eml"
     raw = pki.seal("What is the weather?", signer=pki.author_sign, extra_certs=[pki.author_enc],
                    headers=mail_headers(Subject="Weather", **{"Message-ID": "<q1@example.com>"}))
     deliver(cf, r2, raw, key)
@@ -211,7 +211,7 @@ async def test_reply_survives_a_restart_with_the_same_push_token(pki, bridge):
 
 async def test_unauthenticated_mail_is_dropped_without_reply(pki, bridge):
     cf, agent, r2, _, worker, _ = bridge
-    key = "inbox/mail-hermes-example-org/2.eml"
+    key = "mail-hermes-example-org/2.eml"
     deliver(cf, r2, pki.seal("hi", signer=pki.mallory_sign, headers=mail_headers()), key)
 
     assert await worker.poll_once(INBOUND_ID) == 1
@@ -223,7 +223,7 @@ async def test_unauthenticated_mail_is_dropped_without_reply(pki, bridge):
 async def test_agent_failure_retries_and_keeps_the_mail(pki, bridge):
     cf, agent, r2, _, worker, _ = bridge
     agent.unavailable = True
-    key = "inbox/mail-hermes-example-org/3.eml"
+    key = "mail-hermes-example-org/3.eml"
     deliver(cf, r2, pki.seal("hi", signer=pki.author_sign, headers=mail_headers()), key)
 
     await worker.poll_once(INBOUND_ID)

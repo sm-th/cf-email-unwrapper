@@ -117,7 +117,7 @@ Environment variables only.
 | `R2_ENDPOINT` | no | `https://<CF_ACCOUNT_ID>.r2.cloudflarestorage.com` | R2 S3 endpoint |
 | `R2_ACCESS_KEY_ID` | yes | | R2 S3 access key id (read + delete on the bucket) |
 | `R2_SECRET_ACCESS_KEY` | yes | | R2 S3 secret |
-| `R2_BUCKET` | no | `email-inbox` | Bucket holding the raw messages |
+| `R2_BUCKET` | no | `email-agents` | Bucket holding the raw messages |
 | `AGENT_ADDRESS` | yes | | The agent's email address; also selects the inbound queue |
 | `BOT_KEY` | yes | | Bot private key, PEM (real newlines, `\n` escapes or one line) |
 | `BOT_CERT` | yes | | Bot certificate, PEM (same formats) |

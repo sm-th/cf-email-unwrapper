@@ -74,7 +74,7 @@ class Config:
             r2_endpoint=env.get("R2_ENDPOINT") or f"https://{account_id}.r2.cloudflarestorage.com",
             r2_access_key_id=required("R2_ACCESS_KEY_ID"),
             r2_secret_access_key=required("R2_SECRET_ACCESS_KEY"),
-            r2_bucket=env.get("R2_BUCKET") or "email-inbox",
+            r2_bucket=env.get("R2_BUCKET") or "email-agents",
             agent_address=required("AGENT_ADDRESS").lower(),
             bot_key_pem=normalize_pem(required("BOT_KEY")),
             bot_cert_pem=normalize_pem(required("BOT_CERT")),

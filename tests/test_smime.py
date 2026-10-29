@@ -73,8 +73,10 @@ def test_signature_without_signing_time_is_rejected(pki):
 def test_mail_encrypted_for_someone_else_is_rejected(pki):
     raw = pki.seal("Hi", headers=mail_headers(), signer=pki.author_sign)
     # A bridge holding a different key cannot open the bot's mail.
-    other_bot = Smime(openssl=OPENSSL, bot_cert_pem=pki.stranger_enc.cert_pem,
-                      bot_key_pem=pki.stranger_enc.key_pem, ca_pem=pki.ca.cert_pem)
+    other_bot = Smime(openssl=OPENSSL, signing_cert_pem=pki.bot_sign.cert_pem,
+                      signing_key_pem=pki.bot_sign.key_pem,
+                      encryption_cert_pem=pki.stranger_enc.cert_pem,
+                      encryption_key_pem=pki.stranger_enc.key_pem, ca_pem=pki.ca.cert_pem)
     with pytest.raises(Rejected, match="cannot decrypt"):
         other_bot.open(raw, allowed_senders=ALLOWED, max_age=HOUR, now=datetime.now(UTC))
 
@@ -87,9 +89,23 @@ def test_reply_cert_selection(pki):
         extra_certs=[pki.stranger_enc, pki.mallory_enc, pki.author_enc],
     )
     opened = open_mail(pki, raw)
-    # Only the author's EC keyAgreement certificate from the trusted CA qualifies.
+    # Only the author's encryption certificate from the trusted CA qualifies.
     assert opened.reply_cert_pem is not None
     assert "".join(opened.reply_cert_pem.split()) == "".join(pki.author_enc.cert_pem.split())
+
+
+def test_mail_encrypted_with_rsa_oaep_opens_and_rsa_reply_cert_is_picked(pki):
+    raw = pki.seal("Hi", headers=mail_headers(), signer=pki.author_sign, oaep=True,
+                   extra_certs=[pki.author_enc_rsa])
+    opened = open_mail(pki, raw)
+    assert opened.encrypted and b"Hi" in opened.content
+    assert "".join(opened.reply_cert_pem.split()) == "".join(pki.author_enc_rsa.cert_pem.split())
+
+
+def test_signing_certificate_is_not_a_reply_cert(pki):
+    # The signer's own certificate has neither keyAgreement nor keyEncipherment.
+    raw = pki.seal("Hi", headers=mail_headers(), signer=pki.author_sign)
+    assert open_mail(pki, raw).reply_cert_pem is None
 
 
 def test_no_reply_cert_without_qualifying_certificate(pki):

@@ -39,8 +39,10 @@ class Config:
     r2_secret_access_key: str
     r2_bucket: str
     agent_address: str
-    bot_key_pem: str
-    bot_cert_pem: str
+    bot_signing_key_pem: str
+    bot_signing_cert_pem: str
+    bot_encryption_key_pem: str
+    bot_encryption_cert_pem: str
     ca_cert_pem: str
     allowed_senders: frozenset[str]
     a2a_url: str
@@ -81,8 +83,10 @@ class Config:
             r2_secret_access_key=required("R2_SECRET_ACCESS_KEY"),
             r2_bucket=env.get("R2_BUCKET") or "email-agents",
             agent_address=agent_address,
-            bot_key_pem=normalize_pem(required("BOT_KEY")),
-            bot_cert_pem=normalize_pem(required("BOT_CERT")),
+            bot_signing_key_pem=normalize_pem(required("BOT_SIGNING_KEY")),
+            bot_signing_cert_pem=normalize_pem(required("BOT_SIGNING_CERT")),
+            bot_encryption_key_pem=normalize_pem(required("BOT_ENCRYPTION_KEY")),
+            bot_encryption_cert_pem=normalize_pem(required("BOT_ENCRYPTION_CERT")),
             ca_cert_pem=normalize_pem(required("CA_CERT")),
             allowed_senders=frozenset(
                 s.lower() for s in re.split(r"[\s,]+", required("ALLOWED_SENDERS")) if s

@@ -22,8 +22,10 @@ async def main() -> None:
     queues = Queues(cfg.cf_account_id, cfg.cf_api_token)
     smime = Smime(
         openssl=cfg.openssl,
-        bot_cert_pem=cfg.bot_cert_pem,
-        bot_key_pem=cfg.bot_key_pem,
+        signing_cert_pem=cfg.bot_signing_cert_pem,
+        signing_key_pem=cfg.bot_signing_key_pem,
+        encryption_cert_pem=cfg.bot_encryption_cert_pem,
+        encryption_key_pem=cfg.bot_encryption_key_pem,
         ca_pem=cfg.ca_cert_pem,
     )
     agent = AgentClient(cfg.a2a_url, cfg.a2a_token)

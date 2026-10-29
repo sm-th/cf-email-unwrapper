@@ -96,6 +96,14 @@ async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, ou
     assert text.strip() == "Die Antwort"
 
 
+async def test_reply_signature_carries_the_bot_encryption_certificate(pki, replier, outbox, state):
+    submit(state, reply_cert=pki.author_enc_rsa.cert_pem)
+    await replier.reply_to_task(make_task(TaskState.TASK_STATE_COMPLETED, agent_text="Hi"))
+    raw, _ = parse(outbox.pushed[0])
+    carried = pki.reply_certs(raw, pki.author_enc_rsa)
+    assert "".join(pki.bot_enc.cert_pem.split()) in {"".join(c.split()) for c in carried}
+
+
 async def test_failure_reply_is_signed_only_without_cert_and_marked_urgent(pki, replier, outbox,
                                                                           state):
     submit(state)

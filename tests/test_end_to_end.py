@@ -115,7 +115,9 @@ def start_unwrapper(pki, cf, agent, r2, state_path, **env):
     config = Config.from_env({
         "CF_ACCOUNT_ID": "acct", "CF_API_TOKEN": "cf-token", "R2_ENDPOINT": "http://r2",
         "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s", "AGENT_ADDRESS": BOT,
-        "BOT_KEY": pki.bot.key_pem, "BOT_CERT": pki.bot.cert_pem, "CA_CERT": pki.ca.cert_pem,
+        "BOT_SIGNING_KEY": pki.bot_sign.key_pem, "BOT_SIGNING_CERT": pki.bot_sign.cert_pem,
+        "BOT_ENCRYPTION_KEY": pki.bot_enc.key_pem, "BOT_ENCRYPTION_CERT": pki.bot_enc.cert_pem,
+        "CA_CERT": pki.ca.cert_pem,
         "ALLOWED_SENDERS": AUTHOR, "A2A_URL": "http://agent/", "A2A_TOKEN": "a2a-token",
         "PUSH_URL": PUSH_URL, "PUSH_TOKEN": PUSH_TOKEN, "POLL_INTERVAL": "0.01",
         "OPENSSL": OPENSSL, "STATE_PATH": str(state_path), **env,
@@ -155,7 +157,7 @@ def deliver(cf, r2, raw: bytes, key: str) -> None:
 async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     cf, agent, r2, config, worker, push = bridge
     key = "mail-hermes-example-org/1.eml"
-    raw = pki.seal("What is the weather?", signer=pki.author_sign, extra_certs=[pki.author_enc],
+    raw = pki.seal("What is the weather?", signer=pki.author_sign, extra_certs=[pki.author_enc_rsa],
                    headers=mail_headers(Subject="Weather", **{"Message-ID": "<q1@example.com>"}))
     deliver(cf, r2, raw, key)
 
@@ -191,7 +193,7 @@ async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     headers = email.message_from_bytes(reply, policy=email.policy.default)
     assert headers["Subject"] == "Re: Weather"
     assert headers["In-Reply-To"] == "<q1@example.com>"
-    content = pki.open_reply(reply, recipient=pki.author_enc)
+    content = pki.open_reply(reply, recipient=pki.author_enc_rsa)
     assert b"Sunny." in content
 
 

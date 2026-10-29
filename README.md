@@ -27,8 +27,9 @@ S/MIME check. The agent only speaks plain A2A.
 2. Pulls batches over the Cloudflare Queues HTTP pull API and, for each message, reads the raw
    `.eml` from R2 (S3 API).
 3. Opens the message with the OpenSSL CLI:
-   - decrypts `application/pkcs7-mime` enveloped data with the bot certificate and key
-     (signed-but-unencrypted mail is accepted too);
+   - decrypts `application/pkcs7-mime` enveloped data with the bot encryption certificate and key
+     (RSA key transport, PKCS#1 v1.5 or OAEP, or EC key agreement; signed-but-unencrypted mail is
+     accepted too);
    - requires an S/MIME signature (`multipart/signed` or opaque signed-data) that verifies against
      `CA_CERT` with purpose `smimesign`; unsigned mail is rejected;
    - requires the signer certificate's email (SAN rfc822Name or subject emailAddress) to equal the
@@ -36,8 +37,9 @@ S/MIME check. The agent only speaks plain A2A.
    - requires a CMS `signingTime` no older than `MAX_SIGNATURE_AGE` (and not more than five
      minutes in the future); a missing signingTime is rejected;
    - picks the author's reply encryption certificate from the certificates carried in the
-     signature: issued for the author's address, EC key, keyUsage `keyAgreement`, chains to
-     `CA_CERT` (`openssl verify`). The most recently issued match wins.
+     signature: issued for the author's address, an RSA key with keyUsage `keyEncipherment` or an
+     EC key with keyUsage `keyAgreement`, chains to `CA_CERT` (`openssl verify`). The most recently
+     issued match wins.
 4. Rejected mail is logged, acknowledged and deleted from R2. Unauthenticated senders never get a
    reply.
 5. Authenticated mail is sent to the agent with A2A `SendMessage` (non-blocking,
@@ -55,8 +57,10 @@ S/MIME check. The agent only speaks plain A2A.
    header, fetches the task with `GetTask` and replies only for the states `completed`,
    `input-required`, `failed`, `rejected` and `canceled`, using the email context from the state
    file. The reply text is the text of the task's artifacts plus its status message.
-7. The reply is signed (detached, SHA-256) with the bot certificate and encrypted with AES-256 for
-   the author's reply certificate when one was found (OpenSSL's default ECDH KDF,
+7. The reply is signed (detached, SHA-256) with the bot signing certificate; the signature also
+   carries the bot encryption certificate, so the author's client can encrypt to the bot. It is
+   then encrypted with AES-256 for the author's reply certificate when one was found (OpenSSL
+   defaults: RSA PKCS#1 v1.5 key transport, or for EC the ECDH KDF
    `dhSinglePass-stdDH-sha1kdf-scheme`, which iOS Mail requires). Without a reply certificate the
    reply is signed only. The finished message is pushed to `email-outbox` as
    `{"version": 1, "from", "to", "raw": "<base64>"}`; the push endpoint returns 200 only after that
@@ -120,8 +124,10 @@ Environment variables only.
 | `R2_SECRET_ACCESS_KEY` | yes | | R2 S3 secret |
 | `R2_BUCKET` | no | `email-agents` | Bucket holding the raw messages |
 | `AGENT_ADDRESS` | yes | | The agent's email address; also selects the inbound queue |
-| `BOT_KEY` | yes | | Bot private key, PEM (real newlines, `\n` escapes or one line) |
-| `BOT_CERT` | yes | | Bot certificate, PEM (same formats) |
+| `BOT_SIGNING_KEY` | yes | | Bot signing private key, PEM (real newlines, `\n` escapes or one line) |
+| `BOT_SIGNING_CERT` | yes | | Bot signing certificate, PEM (same formats) |
+| `BOT_ENCRYPTION_KEY` | yes | | Bot encryption private key, PEM (same formats) |
+| `BOT_ENCRYPTION_CERT` | yes | | Bot encryption certificate, PEM (same formats); inbound mail is encrypted to it |
 | `CA_CERT` | yes | | Trusted CA certificate(s), PEM (same formats) |
 | `ALLOWED_SENDERS` | yes | | Comma or whitespace separated author addresses |
 | `A2A_URL` | yes | | Agent JSON-RPC endpoint (e.g. `http://127.0.0.1:8000/`) |

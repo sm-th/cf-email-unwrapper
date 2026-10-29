@@ -69,6 +69,10 @@ async def main() -> None:
         state.close()
 
 
-if __name__ == "__main__":
+def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()

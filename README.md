@@ -138,6 +138,15 @@ Environment variables only.
 
 ## Running
 
+With Nix (the package brings Python, all dependencies and OpenSSL 3; `OPENSSL` defaults to it):
+
+```sh
+set -a; . ./unwrapper.env; set +a
+nix run github:sm-th/cf-email-unwrapper
+```
+
+From a checkout:
+
 ```sh
 uv sync
 uv run python -m cf_email_unwrapper

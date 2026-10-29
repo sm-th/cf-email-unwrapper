@@ -2,8 +2,7 @@
 
 import os
 import re
-import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 _PEM_BLOCK = re.compile(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", re.S)
 
@@ -49,11 +48,11 @@ class Config:
     push_host: str
     push_port: int
     push_url: str
+    push_token: str
     outbox_queue: str
     max_signature_age: float
     poll_interval: float
     openssl: str
-    push_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -88,6 +87,7 @@ class Config:
             push_host=push_host,
             push_port=push_port,
             push_url=env.get("PUSH_URL") or f"http://{url_host}:{push_port}/a2a/push",
+            push_token=required("PUSH_TOKEN"),
             outbox_queue=env.get("OUTBOX_QUEUE") or "email-outbox",
             max_signature_age=parse_duration(env.get("MAX_SIGNATURE_AGE") or "1h"),
             poll_interval=parse_duration(env.get("POLL_INTERVAL") or "5"),

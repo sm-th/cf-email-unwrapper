@@ -106,17 +106,19 @@ class FakeR2:
         self.objects.pop(key, None)
 
 
-@pytest.fixture
-def bridge(pki):
-    cf, agent, r2 = FakeCloudflare(), FakeAgent(), FakeR2()
-    config = Config(
-        cf_account_id="acct", cf_api_token="cf-token", r2_endpoint="http://r2", r2_access_key_id="k",
-        r2_secret_access_key="s", r2_bucket="email-inbox", agent_address=BOT,
-        bot_key_pem=pki.bot.key_pem, bot_cert_pem=pki.bot.cert_pem, ca_cert_pem=pki.ca.cert_pem,
-        allowed_senders=frozenset({AUTHOR}), a2a_url="http://agent/", a2a_token="a2a-token",
-        push_host="127.0.0.1", push_port=8090, push_url=PUSH_URL, outbox_queue="email-outbox",
-        max_signature_age=3600, poll_interval=0.01, openssl=OPENSSL,
-    )
+PUSH_TOKEN = "stable-push-secret"
+
+
+def start_unwrapper(pki, cf, agent, r2, **env):
+    """One unwrapper process: fresh Config, clients, replier state and push app."""
+    config = Config.from_env({
+        "CF_ACCOUNT_ID": "acct", "CF_API_TOKEN": "cf-token", "R2_ENDPOINT": "http://r2",
+        "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s", "AGENT_ADDRESS": BOT,
+        "BOT_KEY": pki.bot.key_pem, "BOT_CERT": pki.bot.cert_pem, "CA_CERT": pki.ca.cert_pem,
+        "ALLOWED_SENDERS": AUTHOR, "A2A_URL": "http://agent/", "A2A_TOKEN": "a2a-token",
+        "PUSH_URL": PUSH_URL, "PUSH_TOKEN": PUSH_TOKEN, "POLL_INTERVAL": "0.01",
+        "OPENSSL": OPENSSL, **env,
+    })
     queues = Queues("acct", "cf-token", httpx.AsyncClient(transport=httpx.MockTransport(cf.handler)))
     a2a = AgentClient(config.a2a_url, config.a2a_token,
                       httpx.AsyncClient(transport=httpx.MockTransport(agent.handler)))
@@ -125,6 +127,13 @@ def bridge(pki):
     worker = Worker(config=config, queues=queues, store=r2, smime=smime, agent=a2a, replier=replier)
     app = create_app(token=config.push_token, agent=a2a, replier=replier)
     push = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://push")
+    return config, worker, push
+
+
+@pytest.fixture
+def bridge(pki):
+    cf, agent, r2 = FakeCloudflare(), FakeAgent(), FakeR2()
+    config, worker, push = start_unwrapper(pki, cf, agent, r2)
     return cf, agent, r2, config, worker, push
 
 
@@ -177,6 +186,27 @@ async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     assert headers["In-Reply-To"] == "<q1@example.com>"
     content = pki.open_reply(reply, recipient=pki.author_enc)
     assert b"Sunny." in content
+
+
+async def test_reply_survives_a_restart_with_the_same_push_token(pki, bridge):
+    cf, agent, r2, _, worker, _ = bridge
+    deliver(cf, r2, pki.seal("Long job", signer=pki.author_sign, headers=mail_headers()), "k.eml")
+    await worker.poll_once(INBOUND_ID)
+    [send] = agent.requests
+    assert send["params"]["configuration"]["taskPushNotificationConfig"]["token"] == PUSH_TOKEN
+
+    # The process restarts before the agent finishes: new Config, replier state and app.
+    _, _, restarted_push = start_unwrapper(pki, cf, agent, r2)
+    agent.complete("task-1", "Finished.")
+    resp = await restarted_push.post(
+        "/a2a/push", json={"task": {"id": "task-1"}}, headers={TOKEN_HEADER: PUSH_TOKEN}
+    )
+    assert resp.status_code == 200
+    assert len(cf.outbox) == 1
+
+    with pytest.raises(ValueError, match="PUSH_TOKEN"):
+        start_unwrapper(pki, cf, agent, r2, PUSH_TOKEN="  ")
+
 
 
 async def test_unauthenticated_mail_is_dropped_without_reply(pki, bridge):

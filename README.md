@@ -42,7 +42,7 @@ S/MIME check. The agent only speaks plain A2A.
    reply.
 5. Authenticated mail is sent to the agent with A2A `SendMessage` (non-blocking,
    `returnImmediately: true`) with a push notification config pointing to this service's push URL
-   and a random per-process token. The message text is the email's `text/plain` body, or its HTML
+   and the configured `PUSH_TOKEN`. The message text is the email's `text/plain` body, or its HTML
    body converted to text. The message carries metadata:
 
    ```json
@@ -89,8 +89,10 @@ persistent state).
 - Text only: attachments are ignored inbound, and replies are a single `text/plain` part.
 - Every email starts a new A2A task in the thread's context; replies to an `input-required`
   question are not attached to the waiting task.
-- The push token is random per process. Notifications for tasks submitted before a restart are
-  rejected with 401, so those replies are lost.
+- Restarts: `PUSH_TOKEN` is a stable secret, so notifications for tasks submitted before a restart
+  or redeploy are still accepted and answered. The "already answered" set is in memory only, so a
+  notification repeated across a restart can produce a second reply. A notification sent while the
+  service is down is only recovered if the agent retries it.
 
 ## Queue naming
 
@@ -126,6 +128,7 @@ Environment variables only.
 | `PUSH_HOST` | no | `127.0.0.1` | Bind address of the push endpoint |
 | `PUSH_PORT` | no | `8090` | Port of the push endpoint |
 | `PUSH_URL` | no | `http://<PUSH_HOST>:<PUSH_PORT>/a2a/push` (`127.0.0.1` when bound to a wildcard) | URL the agent posts notifications to |
+| `PUSH_TOKEN` | yes | | Shared secret the agent echoes in `X-A2A-Notification-Token`; generate once (e.g. `openssl rand -hex 32`) and keep it across restarts |
 | `OUTBOX_QUEUE` | no | `email-outbox` | Outbox queue name |
 | `MAX_SIGNATURE_AGE` | no | `1h` | Maximum signingTime age; seconds or `s`/`m`/`h` suffix |
 | `POLL_INTERVAL` | no | `5` | Pause between empty pulls; seconds or `s`/`m`/`h` suffix |

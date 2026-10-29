@@ -44,7 +44,11 @@ class Pki:
         sign_usage = "digitalSignature,nonRepudiation"
         self.author_sign = self._leaf("author-sign", self.ca, AUTHOR, sign_usage)
         self.author_enc = self._leaf("author-enc", self.ca, AUTHOR, "keyAgreement")
-        self.bot = self._leaf("bot", self.ca, BOT, f"{sign_usage},keyAgreement")
+        self.author_enc_rsa = self._leaf("author-enc-rsa", self.ca, AUTHOR, "keyEncipherment",
+                                         rsa=True)
+        # Like smime-ca: an EC signing certificate and an RSA encryption certificate.
+        self.bot_sign = self._leaf("bot-sign", self.ca, BOT, sign_usage)
+        self.bot_enc = self._leaf("bot-enc", self.ca, BOT, "keyEncipherment", rsa=True)
         self.mallory_sign = self._leaf("mallory-sign", self.other_ca, AUTHOR, sign_usage)
         self.mallory_enc = self._leaf("mallory-enc", self.other_ca, AUTHOR, "keyAgreement")
         self.stranger_enc = self._leaf("stranger-enc", self.ca, "stranger@example.com", "keyAgreement")
@@ -56,14 +60,17 @@ class Pki:
                 "-addext", "keyUsage=critical,keyCertSign,cRLSign", cwd=self.root)
         return Identity(self.root / f"{name}.pem", self.root / f"{name}.key")
 
-    def _leaf(self, name: str, ca: Identity, address: str, key_usage: str) -> Identity:
+    def _leaf(self, name: str, ca: Identity, address: str, key_usage: str, *,
+              rsa: bool = False) -> Identity:
         (self.root / f"{name}.cnf").write_text(
             "[v3]\nbasicConstraints=CA:FALSE\n"
             f"keyUsage=critical,{key_usage}\nextendedKeyUsage=emailProtection\n"
             f"subjectAltName=email:{address}\n"
             "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n"
         )
-        openssl("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        key = ["rsa", "-pkeyopt", "rsa_keygen_bits:2048"] if rsa else [
+            "ec", "-pkeyopt", "ec_paramgen_curve:P-256"]
+        openssl("req", "-new", "-newkey", key[0], *key[1:], "-nodes",
                 "-keyout", f"{name}.key", "-out", f"{name}.csr", "-subj", f"/CN={name}",
                 cwd=self.root)
         openssl("x509", "-req", "-in", f"{name}.csr", "-CA", str(ca.cert), "-CAkey", str(ca.key),
@@ -73,8 +80,10 @@ class Pki:
         return Identity(self.root / f"{name}.pem", self.root / f"{name}.key")
 
     def smime(self) -> Smime:
-        return Smime(openssl=OPENSSL, bot_cert_pem=self.bot.cert_pem,
-                     bot_key_pem=self.bot.key_pem, ca_pem=self.ca.cert_pem)
+        return Smime(openssl=OPENSSL,
+                     signing_cert_pem=self.bot_sign.cert_pem, signing_key_pem=self.bot_sign.key_pem,
+                     encryption_cert_pem=self.bot_enc.cert_pem,
+                     encryption_key_pem=self.bot_enc.key_pem, ca_pem=self.ca.cert_pem)
 
     def seal(
         self,
@@ -84,6 +93,7 @@ class Pki:
         signer: Identity | None,
         extra_certs: list[Identity] = (),
         encrypt: bool = True,
+        oaep: bool = False,
         signed_attributes: bool = True,
     ) -> bytes:
         """``openssl cms -sign | openssl cms -encrypt`` (for the bot), plus mail headers."""
@@ -103,8 +113,9 @@ class Pki:
             openssl(*args, cwd=work)
             current = "signed.eml"
         if encrypt:
+            padding = ["-keyopt", "rsa_padding_mode:oaep"] if oaep else []
             openssl("cms", "-encrypt", "-aes256", "-in", current, "-out", "enc.eml",
-                    str(self.bot.cert), cwd=work)
+                    "-recip", str(self.bot_enc.cert), *padding, cwd=work)
             current = "enc.eml"
         sealed = (work / current).read_bytes()
         if current == "body.eml":
@@ -125,6 +136,19 @@ class Pki:
         openssl("cms", "-verify", "-in", current, "-CAfile", str(self.ca.cert),
                 "-purpose", "smimesign", "-out", "content.eml", cwd=work)
         return (work / "content.eml").read_bytes()
+
+    def reply_certs(self, raw: bytes, recipient: Identity) -> list[str]:
+        """PEM certificates carried in the signature of an encrypted reply."""
+        work = self.root / f"certs-{secrets.token_hex(4)}"
+        work.mkdir()
+        (work / "reply.eml").write_bytes(raw)
+        openssl("cms", "-decrypt", "-in", "reply.eml", "-recip", str(recipient.cert),
+                "-inkey", str(recipient.key), "-out", "dec.eml", cwd=work)
+        openssl("cms", "-verify", "-in", "dec.eml", "-CAfile", str(self.ca.cert),
+                "-purpose", "smimesign", "-certsout", "certs.pem", "-out", "/dev/null", cwd=work)
+        text = (work / "certs.pem").read_text()
+        end = "-----END CERTIFICATE-----"
+        return [c + end for c in text.split(end) if "BEGIN" in c]
 
 
 @pytest.fixture(scope="session")

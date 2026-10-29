@@ -106,10 +106,21 @@ def from_address(msg: email.message.Message) -> str:
 
 
 class Smime:
-    def __init__(self, *, openssl: str, bot_cert_pem: str, bot_key_pem: str, ca_pem: str):
+    def __init__(
+        self,
+        *,
+        openssl: str,
+        signing_cert_pem: str,
+        signing_key_pem: str,
+        encryption_cert_pem: str,
+        encryption_key_pem: str,
+        ca_pem: str,
+    ):
         self._openssl = openssl
-        self._bot_cert = bot_cert_pem
-        self._bot_key = bot_key_pem
+        self._signing_cert = signing_cert_pem
+        self._signing_key = signing_key_pem
+        self._encryption_cert = encryption_cert_pem
+        self._encryption_key = encryption_key_pem
         self._ca = ca_pem
 
     def _run(self, cwd: Path, *args: str) -> None:
@@ -161,8 +172,8 @@ class Smime:
     def _decrypt(self, raw: bytes) -> bytes:
         with _workdir() as d:
             _put(d / "in.eml", raw)
-            _put(d / "bot.pem", self._bot_cert)
-            _put(d / "bot.key", self._bot_key)
+            _put(d / "bot.pem", self._encryption_cert)
+            _put(d / "bot.key", self._encryption_key)
             try:
                 self._run(d, "cms", "-decrypt", "-inform", "SMIME", "-in", "in.eml",
                           "-recip", "bot.pem", "-inkey", "bot.key", "-out", "out.eml")
@@ -203,17 +214,21 @@ class Smime:
     def select_reply_cert(self, certs: list[x509.Certificate], address: str) -> str | None:
         """Pick the author's encryption certificate among the signature's certificates.
 
-        Requirements: issued for ``address``, EC key, keyUsage keyAgreement, and a
-        valid chain to the configured CA. The most recently issued match wins.
+        Requirements: issued for ``address``, an EC key with keyUsage keyAgreement or an RSA
+        key with keyUsage keyEncipherment, and a valid chain to the configured CA. The most
+        recently issued match wins.
         """
         candidates = []
         for cert in certs:
             key_usage = cert.key_usage_value
+            usage = key_usage.native if key_usage is not None else set()
+            algorithm = cert.public_key.algorithm
             if (
                 address in cert_emails(cert)
-                and cert.public_key.algorithm == "ec"
-                and key_usage is not None
-                and "key_agreement" in key_usage.native
+                and (
+                    (algorithm == "ec" and "key_agreement" in usage)
+                    or (algorithm == "rsa" and "key_encipherment" in usage)
+                )
                 and self._chains_to_ca(cert, certs)
             ):
                 candidates.append(cert)
@@ -243,19 +258,23 @@ class Smime:
     def seal(self, entity: bytes, reply_cert_pem: str | None) -> bytes:
         """Sign ``entity`` (detached, SHA-256) and encrypt it for ``reply_cert_pem`` if given.
 
-        Returns a MIME entity (MIME-Version + Content-* headers and body).
+        The signature carries the bot encryption certificate, so the author's client learns
+        where to encrypt follow-ups. Returns a MIME entity (MIME-Version + Content-* headers
+        and body).
         """
         with _workdir() as d:
             _put(d / "in.eml", entity)
-            _put(d / "bot.pem", self._bot_cert)
-            _put(d / "bot.key", self._bot_key)
+            _put(d / "bot.pem", self._signing_cert)
+            _put(d / "bot.key", self._signing_key)
+            _put(d / "bot-encryption.pem", self._encryption_cert)
             self._run(d, "cms", "-sign", "-in", "in.eml", "-signer", "bot.pem",
-                      "-inkey", "bot.key", "-md", "sha256", "-outform", "SMIME",
-                      "-out", "signed.eml")
+                      "-inkey", "bot.key", "-certfile", "bot-encryption.pem", "-md", "sha256",
+                      "-outform", "SMIME", "-out", "signed.eml")
             if reply_cert_pem is None:
                 return (d / "signed.eml").read_bytes()
             _put(d / "recip.pem", reply_cert_pem)
-            # Keep OpenSSL's default ECDH KDF (dhSinglePass-stdDH-sha1kdf): iOS Mail needs it.
+            # OpenSSL defaults: RSA PKCS#1 v1.5 key transport, or for EC the ECDH KDF
+            # dhSinglePass-stdDH-sha1kdf, the only one iOS Mail decrypts.
             self._run(d, "cms", "-encrypt", "-aes256", "-in", "signed.eml",
                       "-outform", "SMIME", "-out", "encrypted.eml", "recip.pem")
             return (d / "encrypted.eml").read_bytes()

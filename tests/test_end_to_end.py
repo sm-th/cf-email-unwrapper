@@ -115,9 +115,9 @@ def start_unwrapper(pki, cf, agent, r2, state_path, **env):
     config = Config.from_env({
         "CF_ACCOUNT_ID": "acct", "CF_API_TOKEN": "cf-token", "R2_ENDPOINT": "http://r2",
         "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s", "AGENT_ADDRESS": BOT,
-        "BOT_SIGNING_KEY": pki.bot_sign.key_pem, "BOT_SIGNING_CERT": pki.bot_sign.cert_pem,
-        "BOT_ENCRYPTION_KEY": pki.bot_enc.key_pem, "BOT_ENCRYPTION_CERT": pki.bot_enc.cert_pem,
-        "CA_CERT": pki.ca.cert_pem,
+        "BOT_SIGNING_KEY_FILE": str(pki.bot_sign.key), "BOT_SIGNING_CERT_FILE": str(pki.bot_sign.cert),
+        "BOT_ENCRYPTION_KEY_FILE": str(pki.bot_enc.key),
+        "BOT_ENCRYPTION_CERT_FILE": str(pki.bot_enc.cert), "CA_CERT_FILE": str(pki.ca.cert),
         "ALLOWED_SENDERS": AUTHOR, "A2A_URL": "http://agent/", "A2A_TOKEN": "a2a-token",
         "PUSH_URL": PUSH_URL, "PUSH_TOKEN": PUSH_TOKEN, "POLL_INTERVAL": "0.01",
         "OPENSSL": OPENSSL, "STATE_PATH": str(state_path), **env,
@@ -227,6 +227,8 @@ async def test_task_finished_while_down_is_answered_once_after_restart(pki, brid
 
     with pytest.raises(ValueError, match="PUSH_TOKEN"):
         start_unwrapper(pki, cf, agent, r2, state_path, PUSH_TOKEN="  ")
+    with pytest.raises(ValueError, match="CA_CERT_FILE: cannot read"):
+        start_unwrapper(pki, cf, agent, r2, state_path, CA_CERT_FILE=str(state_path) + ".missing")
 
 
 async def test_redelivered_mail_reaches_the_agent_once(pki, bridge):

@@ -31,14 +31,14 @@ S/MIME check. The agent only speaks plain A2A.
      (RSA key transport, PKCS#1 v1.5 or OAEP, or EC key agreement; signed-but-unencrypted mail is
      accepted too);
    - requires an S/MIME signature (`multipart/signed` or opaque signed-data) that verifies against
-     `CA_CERT` with purpose `smimesign`; unsigned mail is rejected;
+     `CA_CERT_FILE` with purpose `smimesign`; unsigned mail is rejected;
    - requires the signer certificate's email (SAN rfc822Name or subject emailAddress) to equal the
      `From` address, and that address to be in `ALLOWED_SENDERS`;
    - requires a CMS `signingTime` no older than `MAX_SIGNATURE_AGE` (and not more than five
      minutes in the future); a missing signingTime is rejected;
    - picks the author's reply encryption certificate from the certificates carried in the
      signature: issued for the author's address, an RSA key with keyUsage `keyEncipherment` or an
-     EC key with keyUsage `keyAgreement`, chains to `CA_CERT` (`openssl verify`). The most recently
+     EC key with keyUsage `keyAgreement`, chains to `CA_CERT_FILE` (`openssl verify`). The most recently
      issued match wins.
 4. Rejected mail is logged, acknowledged and deleted from R2. Unauthenticated senders never get a
    reply.
@@ -124,11 +124,11 @@ Environment variables only.
 | `R2_SECRET_ACCESS_KEY` | yes | | R2 S3 secret |
 | `R2_BUCKET` | no | `email-agents` | Bucket holding the raw messages |
 | `AGENT_ADDRESS` | yes | | The agent's email address; also selects the inbound queue |
-| `BOT_SIGNING_KEY` | yes | | Bot signing private key, PEM (real newlines, `\n` escapes or one line) |
-| `BOT_SIGNING_CERT` | yes | | Bot signing certificate, PEM (same formats) |
-| `BOT_ENCRYPTION_KEY` | yes | | Bot encryption private key, PEM (same formats) |
-| `BOT_ENCRYPTION_CERT` | yes | | Bot encryption certificate, PEM (same formats); inbound mail is encrypted to it |
-| `CA_CERT` | yes | | Trusted CA certificate(s), PEM (same formats) |
+| `BOT_SIGNING_KEY_FILE` | yes | | Path to the bot signing private key (unencrypted PEM) |
+| `BOT_SIGNING_CERT_FILE` | yes | | Path to the bot signing certificate (PEM) |
+| `BOT_ENCRYPTION_KEY_FILE` | yes | | Path to the bot encryption private key (unencrypted PEM) |
+| `BOT_ENCRYPTION_CERT_FILE` | yes | | Path to the bot encryption certificate (PEM); inbound mail is encrypted to it |
+| `CA_CERT_FILE` | yes | | Path to the trusted CA certificate(s) (PEM) |
 | `ALLOWED_SENDERS` | yes | | Comma or whitespace separated author addresses |
 | `A2A_URL` | yes | | Agent JSON-RPC endpoint (e.g. `http://127.0.0.1:8000/`) |
 | `A2A_TOKEN` | yes | | Bearer token for the agent |
@@ -162,7 +162,9 @@ or with Docker (the image contains Debian's OpenSSL 3 and binds the push endpoin
 
 ```sh
 docker build -t cf-email-unwrapper .
-docker run --env-file unwrapper.env -p 8090:8090 cf-email-unwrapper
+docker run --env-file unwrapper.env -p 8090:8090 \
+  -v "$PWD/keys:/keys:ro" -v unwrapper-state:/state -e STATE_PATH=/state/state.sqlite3 \
+  cf-email-unwrapper   # with BOT_*_FILE and CA_CERT_FILE pointing into /keys
 ```
 
 ## Development

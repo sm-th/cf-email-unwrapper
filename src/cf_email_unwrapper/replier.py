@@ -1,14 +1,11 @@
-"""Turns finished agent tasks into signed (and encrypted) email replies on the outbox queue."""
+"""Turns finished agent tasks into signed (and encrypted) email replies in the local outbox."""
 
 import asyncio
-import base64
-import json
 import logging
-from typing import Any
+from collections.abc import Callable
 
 from a2a.types.a2a_pb2 import Message, Task, TaskState
 
-from .cloudflare import CloudflareError, Queues
 from .mail import compose_reply, text_entity
 from .smime import Smime
 from .state import Mail, State
@@ -24,8 +21,8 @@ REPLY_STATES: dict[int, bool] = {
     TaskState.TASK_STATE_CANCELED: True,
 }
 
-# A queue message is limited to 128 KB; leave room for the envelope.
-MAX_OUTBOX_JSON = 120_000
+# Larger replies are replaced by a notice; Cloudflare send_email accepts up to 25 MiB.
+MAX_REPLY_BYTES = 20_000_000
 
 # Input-required can still be followed by another state; the others end the task.
 NON_FINAL_REPLY_STATES = {TaskState.TASK_STATE_INPUT_REQUIRED}
@@ -50,14 +47,17 @@ def agent_text(task: Task) -> str:
 
 class Replier:
     def __init__(
-        self, *, queues: Queues, outbox_queue: str, smime: Smime, agent_address: str, state: State
+        self,
+        *,
+        smime: Smime,
+        agent_address: str,
+        state: State,
+        on_queued: Callable[[], None] = lambda: None,
     ):
-        self._queues = queues
-        self._outbox_queue = outbox_queue
-        self._outbox_id: str | None = None
         self._smime = smime
         self._agent_address = agent_address
         self._state = state
+        self._on_queued = on_queued
         self._lock = asyncio.Lock()
 
     async def reply_to_task(self, task: Task) -> None:
@@ -75,29 +75,37 @@ class Replier:
             text = agent_text(task) or (
                 f"The agent finished without a text answer ({TaskState.Name(state)})."
             )
-            await self.reply(mail, text, urgent=REPLY_STATES[state])
-            self._state.record_reply(task.id, state, final=state not in NON_FINAL_REPLY_STATES)
+            raw = await self.compose(mail, text, urgent=REPLY_STATES[state])
+            self._state.record_reply(
+                task.id, state, final=state not in NON_FINAL_REPLY_STATES,
+                recipient=mail.author, raw=raw,
+            )
+        self._queued(mail)
 
     async def reply_to_message(self, message: Message, mail: Mail) -> None:
         """Reply for an agent that answered SendMessage with a direct message."""
-        await self.reply(mail, _message_text(message), urgent=False)
-        self._state.close_mail(mail.message_id)
+        raw = await self.compose(mail, _message_text(message), urgent=False)
+        self._state.record_direct_reply(mail.message_id, recipient=mail.author, raw=raw)
+        self._queued(mail)
 
-    async def reply(self, mail: Mail, text: str, *, urgent: bool) -> None:
-        body = await asyncio.to_thread(self._outbox_body, mail, text, urgent)
-        if len(json.dumps(body)) > MAX_OUTBOX_JSON:
-            log.warning("reply to %s is too large for the outbox; sending a notice", mail.author)
+    def _queued(self, mail: Mail) -> None:
+        log.info("reply to %s queued (%s)", mail.author, mail.message_id)
+        self._on_queued()
+
+    async def compose(self, mail: Mail, text: str, *, urgent: bool) -> bytes:
+        raw = await asyncio.to_thread(self._compose, mail, text, urgent)
+        if len(raw) > MAX_REPLY_BYTES:
+            log.warning("reply to %s is too large to send; sending a notice", mail.author)
             notice = (
                 "The agent's answer is too large to be delivered by email "
                 f"({len(text.encode())} bytes of text)."
             )
-            body = await asyncio.to_thread(self._outbox_body, mail, notice, True)
-        await self._queues.push(await self._outbox_queue_id(), body)
-        log.info("reply to %s queued (%s)", mail.author, mail.message_id)
+            raw = await asyncio.to_thread(self._compose, mail, notice, True)
+        return raw
 
-    def _outbox_body(self, mail: Mail, text: str, urgent: bool) -> dict[str, Any]:
+    def _compose(self, mail: Mail, text: str, urgent: bool) -> bytes:
         sealed = self._smime.seal(text_entity(text), mail.reply_cert_pem)
-        raw = compose_reply(
+        return compose_reply(
             sealed,
             agent_address=self._agent_address,
             author=mail.author,
@@ -106,16 +114,3 @@ class Replier:
             parent_references=mail.references,
             urgent=urgent,
         )
-        return {
-            "version": 1,
-            "from": self._agent_address,
-            "to": mail.author,
-            "raw": base64.b64encode(raw).decode(),
-        }
-
-    async def _outbox_queue_id(self) -> str:
-        if self._outbox_id is None:
-            self._outbox_id = await self._queues.find_queue_id(self._outbox_queue)
-            if self._outbox_id is None:
-                raise CloudflareError(f"outbox queue {self._outbox_queue!r} does not exist")
-        return self._outbox_id

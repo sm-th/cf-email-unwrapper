@@ -1,4 +1,3 @@
-import base64
 import email
 import email.policy
 
@@ -6,20 +5,9 @@ import pytest
 from a2a.types.a2a_pb2 import Artifact, Message, Part, Role, Task, TaskState, TaskStatus
 from conftest import AUTHOR, BOT
 
+from cf_email_unwrapper import replier as replier_module
 from cf_email_unwrapper.replier import Replier
 from cf_email_unwrapper.state import Mail, State
-
-
-class FakeOutbox:
-    def __init__(self):
-        self.pushed: list[dict] = []
-
-    async def find_queue_id(self, name):
-        return "outbox-id" if name == "email-outbox" else None
-
-    async def push(self, queue_id, body):
-        assert queue_id == "outbox-id"
-        self.pushed.append(body)
 
 
 def submit(state: State, task_id="task-1", reply_cert=None) -> None:
@@ -48,9 +36,19 @@ def make_task(state, *, agent_text="", task_id="task-1", artifact_text=""):
     return task
 
 
-@pytest.fixture
-def outbox():
-    return FakeOutbox()
+class Outbox:
+    """The replies queued in the state, plus how often the sender was woken."""
+
+    def __init__(self, state: State):
+        self.state = state
+        self.wakeups = 0
+
+    def wake(self):
+        self.wakeups += 1
+
+    @property
+    def pushed(self):
+        return self.state.outbox()
 
 
 @pytest.fixture
@@ -61,14 +59,17 @@ def state():
 
 
 @pytest.fixture
+def outbox(state):
+    return Outbox(state)
+
+
+@pytest.fixture
 def replier(pki, outbox, state):
-    return Replier(queues=outbox, outbox_queue="email-outbox", smime=pki.smime(), agent_address=BOT,
-                   state=state)
+    return Replier(smime=pki.smime(), agent_address=BOT, state=state, on_queued=outbox.wake)
 
 
-def parse(body):
-    raw = base64.b64decode(body["raw"])
-    return raw, email.message_from_bytes(raw, policy=email.policy.default)
+def parse(reply):
+    return reply.raw, email.message_from_bytes(reply.raw, policy=email.policy.default)
 
 
 async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, outbox, state):
@@ -77,7 +78,7 @@ async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, ou
     await replier.reply_to_task(task)
 
     [body] = outbox.pushed
-    assert (body["version"], body["from"], body["to"]) == (1, BOT, AUTHOR)
+    assert body.recipient == AUTHOR and outbox.wakeups == 1
     raw, msg = parse(body)
     raw.decode("ascii")  # RFC 2047 keeps the header block ASCII
     assert msg["Subject"] == "Re: Grüße aus Berlin"
@@ -138,9 +139,10 @@ async def test_non_final_states_and_unknown_tasks_are_ignored(replier, outbox, s
     assert outbox.pushed == []
 
 
-async def test_oversized_answer_becomes_an_urgent_notice(replier, outbox, state):
+async def test_oversized_answer_becomes_an_urgent_notice(replier, outbox, state, monkeypatch):
+    monkeypatch.setattr(replier_module, "MAX_REPLY_BYTES", 50_000)
     submit(state)
     await replier.reply_to_task(make_task(TaskState.TASK_STATE_COMPLETED, agent_text="x" * 200_000))
     [body] = outbox.pushed
-    assert len(body["raw"]) < 120_000
+    assert len(body.raw) < 50_000
     assert parse(body)[1]["Importance"] == "high"

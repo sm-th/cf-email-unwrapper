@@ -7,10 +7,10 @@ import logging
 import uvicorn
 
 from .agent import AgentClient
-from .cloudflare import Queues
 from .config import Config
+from .gateway import Gateway
+from .outbox import Sender
 from .push import create_app
-from .r2 import R2Store
 from .replier import Replier
 from .smime import Smime
 from .state import State
@@ -19,7 +19,6 @@ from .worker import Worker
 
 async def main() -> None:
     cfg = Config.from_env()
-    queues = Queues(cfg.cf_account_id, cfg.cf_api_token)
     smime = Smime(
         openssl=cfg.openssl,
         signing_cert_pem=cfg.bot_signing_cert_pem,
@@ -30,28 +29,12 @@ async def main() -> None:
     )
     agent = AgentClient(cfg.a2a_url, cfg.a2a_token)
     state = State(cfg.state_path)
-    replier = Replier(
-        queues=queues,
-        outbox_queue=cfg.outbox_queue,
-        smime=smime,
-        agent_address=cfg.agent_address,
-        state=state,
-    )
-    store = R2Store(
-        endpoint=cfg.r2_endpoint,
-        access_key_id=cfg.r2_access_key_id,
-        secret_access_key=cfg.r2_secret_access_key,
-        bucket=cfg.r2_bucket,
-    )
-    worker = Worker(
-        config=cfg,
-        queues=queues,
-        store=store,
-        smime=smime,
-        agent=agent,
-        replier=replier,
-        state=state,
-    )
+    sender = Sender(state)
+    replier = Replier(smime=smime, agent_address=cfg.agent_address, state=state,
+                      on_queued=sender.wake)
+    worker = Worker(config=cfg, smime=smime, agent=agent, replier=replier, state=state)
+    gateway = Gateway(cfg.mailbox_url, cfg.gateway_token, on_mail=worker.handle,
+                      on_connect=sender.wake)
     server = uvicorn.Server(
         uvicorn.Config(
             create_app(token=cfg.push_token, agent=agent, replier=replier),
@@ -60,14 +43,20 @@ async def main() -> None:
             log_level="info",
         )
     )
-    # uvicorn handles SIGINT/SIGTERM; stop the worker when the server shuts down.
-    worker_task = asyncio.create_task(worker.run())
+    # uvicorn handles SIGINT/SIGTERM; stop everything else when the server shuts down.
+    tasks = [
+        asyncio.create_task(worker.recover()),
+        asyncio.create_task(gateway.run()),
+        asyncio.create_task(sender.run(gateway)),
+    ]
     try:
         await server.serve()
     finally:
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         state.close()
 
 

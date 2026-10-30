@@ -1,10 +1,12 @@
-"""Local state: the email context of every mail handed to the agent, and the replies sent.
+"""Local state: the email context of every mail handed to the agent, the replies made and the
+outbox of replies not yet confirmed by the gateway.
 
 The agent only receives the text. Everything needed to reply lives here, keyed by the task id,
 so replies survive restarts and do not depend on what the agent keeps.
 """
 
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +28,14 @@ CREATE TABLE IF NOT EXISTS replies (
     sent_at TEXT NOT NULL,
     PRIMARY KEY (task_id, state)
 );
+CREATE TABLE IF NOT EXISTS outbox (
+    id              TEXT PRIMARY KEY,
+    recipient       TEXT NOT NULL,
+    raw             BLOB NOT NULL,
+    created_at      REAL NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL
+);
 """
 
 
@@ -38,6 +48,18 @@ class Mail:
     subject: str
     references: str
     reply_cert_pem: str | None
+
+
+@dataclass(frozen=True)
+class OutboxReply:
+    """A finished reply waiting to be sent; times are Unix timestamps."""
+
+    id: str
+    recipient: str
+    raw: bytes
+    created_at: float
+    attempts: int
+    next_attempt_at: float
 
 
 def _now() -> str:
@@ -80,12 +102,6 @@ class State:
     def attach_task(self, message_id: str, task_id: str) -> None:
         self._db.execute("UPDATE mails SET task_id = ? WHERE message_id = ?", (task_id, message_id))
 
-    def close_mail(self, message_id: str) -> None:
-        self._db.execute(
-            "UPDATE mails SET closed_at = ? WHERE message_id = ? AND closed_at IS NULL",
-            (_now(), message_id),
-        )
-
     def mail_for_task(self, task_id: str) -> Mail | None:
         row = self._db.execute(
             "SELECT message_id, author, subject, refs, reply_cert_pem FROM mails WHERE task_id = ?",
@@ -107,7 +123,10 @@ class State:
         ).fetchone()
         return row is not None
 
-    def record_reply(self, task_id: str, state: int, *, final: bool) -> None:
+    def record_reply(
+        self, task_id: str, state: int, *, final: bool, recipient: str, raw: bytes
+    ) -> None:
+        """Record the (task, state) answer and queue its reply in one transaction."""
         with self._db:
             self._db.execute("BEGIN")
             self._db.execute(
@@ -119,3 +138,42 @@ class State:
                     "UPDATE mails SET closed_at = ? WHERE task_id = ? AND closed_at IS NULL",
                     (_now(), task_id),
                 )
+            self._enqueue(recipient, raw)
+
+    def record_direct_reply(self, message_id: str, *, recipient: str, raw: bytes) -> None:
+        """Close a mail the agent answered directly and queue the reply in one transaction."""
+        with self._db:
+            self._db.execute("BEGIN")
+            self._db.execute(
+                "UPDATE mails SET closed_at = ? WHERE message_id = ? AND closed_at IS NULL",
+                (_now(), message_id),
+            )
+            self._enqueue(recipient, raw)
+
+    def _enqueue(self, recipient: str, raw: bytes) -> None:
+        now = datetime.now(UTC).timestamp()
+        self._db.execute(
+            "INSERT INTO outbox (id, recipient, raw, created_at, next_attempt_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), recipient, raw, now, now),
+        )
+
+    def outbox(self) -> list[OutboxReply]:
+        """Queued replies, the next due first."""
+        rows = self._db.execute(
+            "SELECT id, recipient, raw, created_at, attempts, next_attempt_at FROM outbox"
+            " ORDER BY next_attempt_at, created_at"
+        )
+        return [OutboxReply(*row) for row in rows]
+
+    def next_reply_due(self) -> float | None:
+        return self._db.execute("SELECT min(next_attempt_at) FROM outbox").fetchone()[0]
+
+    def postpone_reply(self, reply_id: str, next_attempt_at: float) -> None:
+        self._db.execute(
+            "UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ? WHERE id = ?",
+            (next_attempt_at, reply_id),
+        )
+
+    def remove_reply(self, reply_id: str) -> None:
+        self._db.execute("DELETE FROM outbox WHERE id = ?", (reply_id,))

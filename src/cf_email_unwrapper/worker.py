@@ -1,24 +1,21 @@
-"""Inbound loop: queue -> R2 -> S/MIME -> A2A SendMessage."""
+"""Inbound path: gateway mail frame -> S/MIME -> A2A SendMessage."""
 
 import asyncio
 import email
 import email.policy
 import logging
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 
 from .agent import AgentClient
-from .cloudflare import PulledMessage, Queues, decode_body
 from .config import Config
+from .gateway import InboundMail
 from .mail import a2a_message_id, context_id, extract_text, own_message_id, thread_root
-from .queue_name import queue_name
-from .r2 import ObjectStore
 from .replier import REPLY_STATES, Replier
-from .smime import Rejected, Smime
+from .smime import Opened, Rejected, Smime
 from .state import Mail, State
 
 log = logging.getLogger(__name__)
-
-RETRY_DELAY_SECONDS = 30
 
 
 class Worker:
@@ -26,32 +23,20 @@ class Worker:
         self,
         *,
         config: Config,
-        queues: Queues,
-        store: ObjectStore,
         smime: Smime,
         agent: AgentClient,
         replier: Replier,
         state: State,
+        retry_delay: float = 30,
     ):
         self._cfg = config
-        self._queues = queues
-        self._store = store
         self._smime = smime
         self._agent = agent
         self._replier = replier
         self._state = state
-
-    async def run(self) -> None:
-        await self.recover()
-        queue_id = await self.wait_for_queue()
-        while True:
-            try:
-                handled = await self.poll_once(queue_id)
-            except Exception:
-                log.exception("polling failed")
-                handled = 0
-            if not handled:
-                await asyncio.sleep(self._cfg.poll_interval)
+        self._retry_delay = retry_delay
+        # Serializes the Message-ID check and SendMessage, so duplicates reach the agent once.
+        self._deliver_lock = asyncio.Lock()
 
     async def recover(self) -> None:
         """Answer tasks that finished while no notification could reach this process."""
@@ -61,50 +46,19 @@ class Worker:
             except Exception:
                 log.exception("checking open task %s failed", task_id)
 
-    async def wait_for_queue(self) -> str:
-        """The gateway creates the inbound queue on the first email; wait for it."""
-        name = queue_name(self._cfg.agent_address)
-        logged = False
+    async def handle(self, mail: InboundMail) -> bool:
+        """Deliver a gateway mail, retrying transient failures; True once it may be acked."""
         while True:
             try:
-                queue_id = await self._queues.find_queue_id(name)
-            except Exception:
-                log.exception("looking up queue %s failed", name)
-            else:
-                if queue_id:
-                    log.info("consuming queue %s (%s)", name, queue_id)
-                    return queue_id
-                if not logged:
-                    log.info("queue %s does not exist yet; waiting for the first email", name)
-                    logged = True
-            await asyncio.sleep(self._cfg.poll_interval)
-
-    async def poll_once(self, queue_id: str) -> int:
-        messages = await self._queues.pull(queue_id)
-        for message in messages:
-            await self.handle(queue_id, message)
-        return len(messages)
-
-    async def handle(self, queue_id: str, message: PulledMessage) -> None:
-        try:
-            body = decode_body(message.body)
-            if body.get("version") != 1:
-                raise ValueError(f"unsupported message version {body.get('version')!r}")
-            key = body["r2Key"]
-            raw = await asyncio.to_thread(self._store.get, key)
-            if raw is None:
-                log.warning("R2 object %s is gone (already handled); dropping message", key)
-                await self._queues.ack(queue_id, message.lease_id)
-                return
-            try:
-                await self._deliver(raw)
+                await self._deliver(mail.raw)
+                return True
             except Rejected as e:
-                log.warning("rejected %s (envelope from %s): %s", key, body.get("from"), e)
-            await self._queues.ack(queue_id, message.lease_id)
-            await asyncio.to_thread(self._store.delete, key)
-        except Exception:
-            log.exception("handling queue message %s failed; retrying later", message.id)
-            await self._queues.retry(queue_id, message.lease_id, RETRY_DELAY_SECONDS)
+                log.warning("rejected mail %s (envelope from %s): %s", mail.id, mail.sender, e)
+                return True
+            except Exception:
+                log.exception("handling mail %s failed; retrying in %g s", mail.id,
+                              self._retry_delay)
+            await asyncio.sleep(self._retry_delay)
 
     async def _deliver(self, raw: bytes) -> None:
         opened = await asyncio.to_thread(
@@ -116,6 +70,10 @@ class Worker:
         )
         outer = email.message_from_bytes(raw, policy=email.policy.default)
         message_id = own_message_id(outer, raw)
+        async with self._deliver_lock:
+            await self._send_to_agent(outer, message_id, opened)
+
+    async def _send_to_agent(self, outer: EmailMessage, message_id: str, opened: Opened) -> None:
         if self._state.delivered(message_id):
             log.info("%s was already handed to the agent; skipping the redelivery", message_id)
             return

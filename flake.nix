@@ -64,8 +64,6 @@
           venv = pythonSets.${system}.mkVirtualEnv "cf-email-unwrapper-env" workspace.deps.default;
         in
         {
-          # Stand-in A2A agent for testing a guardian.
-          echo-agent = venv;
           default = pkgs.writeShellApplication {
             name = "cf-email-unwrapper";
             text = ''
@@ -80,10 +78,6 @@
         default = {
           type = "app";
           program = lib.getExe self.packages.${system}.default;
-        };
-        echo-agent = {
-          type = "app";
-          program = "${self.packages.${system}.echo-agent}/bin/cf-email-echo-agent";
         };
       });
 

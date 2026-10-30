@@ -25,7 +25,7 @@ from conftest import AUTHOR, BOT, OPENSSL, mail_headers
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-from cf_email_unwrapper.agent import AgentClient
+from cf_email_unwrapper.agent import AgentClient, EchoAgent
 from cf_email_unwrapper.config import Config, mailbox_url
 from cf_email_unwrapper.gateway import SIGNATURE_HEADER, Gateway, decode_frame, encode_frame
 from cf_email_unwrapper.outbox import Sender
@@ -313,6 +313,34 @@ async def test_mail_round_trip_produces_exactly_one_reply(pki, gateway, agent, s
     assert b"Sunny." in content
     await asyncio.sleep(0.2)
     assert len(gateway.sends) == 1
+
+
+async def test_demo_mode_echoes_without_an_agent(pki, gateway, state_path, capsys):
+    config = load_config(pki, gateway.url, state_path, A2A_URL="", A2A_TOKEN="", PUSH_TOKEN="")
+    assert config.a2a_url is None and config.push_token is None
+    smime = pki.smime()
+    state = State(config.state_path)
+    sender = Sender(state, retry_delay=FAST)
+    replier = Replier(smime=smime, agent_address=BOT, state=state, on_queued=sender.wake)
+    worker = Worker(config=config, smime=smime, agent=EchoAgent(), replier=replier, state=state,
+                    retry_delay=FAST)
+    client = Gateway(config.mailbox_url, lambda: smime.sign_mailbox_challenge(BOT),
+                     on_mail=worker.handle, on_connect=sender.wake, min_delay=FAST, max_delay=FAST)
+    tasks = [asyncio.create_task(client.run()), asyncio.create_task(sender.run(client))]
+    try:
+        raw = pki.seal("Ping", signer=pki.author_sign, extra_certs=[pki.author_enc_rsa],
+                       headers=mail_headers())
+        mail_id = await gateway.deliver(raw)
+        await eventually(lambda: gateway.acked == [mail_id] and gateway.sent)
+        [(to, reply)] = gateway.sent
+        assert to == AUTHOR
+        assert b"Echo: Ping" in pki.open_reply(reply, recipient=pki.author_enc_rsa)
+        assert "Ping" in capsys.readouterr().out
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        state.close()
 
 
 async def test_task_finished_while_down_is_answered_once_after_restart(

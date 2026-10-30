@@ -52,12 +52,12 @@ class Config:
     bot_encryption_cert_pem: str
     ca_cert_pem: str
     allowed_senders: frozenset[str]
-    a2a_url: str
-    a2a_token: str
+    a2a_url: str | None  # None: demo mode, the guardian answers with an echo itself
+    a2a_token: str | None
     push_host: str
     push_port: int
     push_url: str
-    push_token: str
+    push_token: str | None
     max_signature_age: float
     openssl: str
     state_path: str
@@ -76,6 +76,7 @@ class Config:
         state_home = env.get("XDG_STATE_HOME") or os.path.join(
             env.get("HOME") or os.path.expanduser("~"), ".local", "state"
         )
+        a2a_url = env.get("A2A_URL", "").strip() or None
         push_host = env.get("PUSH_HOST", "127.0.0.1")
         push_port = int(env.get("PUSH_PORT", "8090"))
         url_host = "127.0.0.1" if push_host in ("0.0.0.0", "::") else push_host
@@ -90,12 +91,12 @@ class Config:
             allowed_senders=frozenset(
                 s.lower() for s in re.split(r"[\s,]+", required("ALLOWED_SENDERS")) if s
             ),
-            a2a_url=required("A2A_URL"),
-            a2a_token=required("A2A_TOKEN"),
+            a2a_url=a2a_url,
+            a2a_token=required("A2A_TOKEN") if a2a_url else None,
             push_host=push_host,
             push_port=push_port,
             push_url=env.get("PUSH_URL") or f"http://{url_host}:{push_port}/a2a/push",
-            push_token=required("PUSH_TOKEN"),
+            push_token=required("PUSH_TOKEN") if a2a_url else None,
             max_signature_age=parse_duration(env.get("MAX_SIGNATURE_AGE") or "1h"),
             openssl=env.get("OPENSSL") or "openssl",
             state_path=env.get("STATE_PATH")

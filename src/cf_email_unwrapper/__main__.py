@@ -6,7 +6,7 @@ import logging
 
 import uvicorn
 
-from .agent import AgentClient
+from .agent import AgentClient, EchoAgent
 from .config import Config
 from .gateway import Gateway
 from .outbox import Sender
@@ -15,6 +15,8 @@ from .replier import Replier
 from .smime import Smime
 from .state import State
 from .worker import Worker
+
+log = logging.getLogger(__name__)
 
 
 async def main() -> None:
@@ -27,7 +29,11 @@ async def main() -> None:
         encryption_key_pem=cfg.bot_encryption_key_pem,
         ca_pem=cfg.ca_cert_pem,
     )
-    agent = AgentClient(cfg.a2a_url, cfg.a2a_token)
+    if cfg.a2a_url:
+        agent = AgentClient(cfg.a2a_url, cfg.a2a_token)
+    else:
+        agent = EchoAgent()
+        log.warning("A2A_URL is not set: demo mode, every authenticated mail gets an echo reply")
     state = State(cfg.state_path)
     sender = Sender(state)
     replier = Replier(smime=smime, agent_address=cfg.agent_address, state=state,
@@ -35,22 +41,26 @@ async def main() -> None:
     worker = Worker(config=cfg, smime=smime, agent=agent, replier=replier, state=state)
     gateway = Gateway(cfg.mailbox_url, lambda: smime.sign_mailbox_challenge(cfg.agent_address),
                       on_mail=worker.handle, on_connect=sender.wake)
-    server = uvicorn.Server(
-        uvicorn.Config(
-            create_app(token=cfg.push_token, agent=agent, replier=replier),
-            host=cfg.push_host,
-            port=cfg.push_port,
-            log_level="info",
-        )
-    )
-    # uvicorn handles SIGINT/SIGTERM; stop everything else when the server shuts down.
     tasks = [
         asyncio.create_task(worker.recover()),
         asyncio.create_task(gateway.run()),
         asyncio.create_task(sender.run(gateway)),
     ]
     try:
-        await server.serve()
+        if cfg.a2a_url:
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    create_app(token=cfg.push_token, agent=agent, replier=replier),
+                    host=cfg.push_host,
+                    port=cfg.push_port,
+                    log_level="info",
+                )
+            )
+            # uvicorn handles SIGINT/SIGTERM; stop everything else when the server shuts down.
+            await server.serve()
+        else:
+            # Demo mode has no push endpoint; Ctrl-C cancels this wait.
+            await asyncio.gather(*tasks[1:])
     finally:
         for task in tasks:
             task.cancel()

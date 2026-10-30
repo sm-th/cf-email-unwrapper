@@ -19,7 +19,6 @@ dependencies = [
 
 [project.scripts]
 cf-email-unwrapper = "cf_email_unwrapper.__main__:run"
-cf-email-echo-agent = "cf_email_unwrapper.echo_agent:run"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]

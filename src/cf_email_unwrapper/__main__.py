@@ -3,11 +3,13 @@
 import asyncio
 import contextlib
 import logging
+import os
+import sys
 
 import uvicorn
 
 from .agent import AgentClient, EchoAgent
-from .config import Config
+from .config import Config, load_env
 from .gateway import Gateway
 from .outbox import Sender
 from .push import create_app
@@ -19,8 +21,7 @@ from .worker import Worker
 log = logging.getLogger(__name__)
 
 
-async def main() -> None:
-    cfg = Config.from_env()
+async def main(cfg: Config) -> None:
     smime = Smime(
         openssl=cfg.openssl,
         signing_cert_pem=cfg.bot_signing_cert_pem,
@@ -72,7 +73,14 @@ async def main() -> None:
 
 def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(main())
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help")):
+        sys.exit("usage: cf-email-unwrapper [NAME | PATH.env]")
+    try:
+        cfg = Config.from_env(load_env(sys.argv[1] if len(sys.argv) == 2 else None,
+                                       dict(os.environ)))
+    except ValueError as e:
+        sys.exit(f"cf-email-unwrapper: {e}")
+    asyncio.run(main(cfg))
 
 
 if __name__ == "__main__":

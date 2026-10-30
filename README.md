@@ -183,9 +183,15 @@ Environment variables only.
 With Nix (the package brings Python, all dependencies and OpenSSL 3; `OPENSSL` defaults to it):
 
 ```sh
-set -a; . ./unwrapper.env; set +a
-nix run github:sm-th/cf-email-unwrapper
+nix run github:sm-th/cf-email-unwrapper            # the only *.env in ~/.config/cf-email-unwrapper/
+nix run github:sm-th/cf-email-unwrapper -- hermes  # ~/.config/cf-email-unwrapper/hermes.env
+nix run github:sm-th/cf-email-unwrapper -- ./x.env # any file
 ```
+
+The configuration is read from an env file (`NAME=value` lines, `#` comments, values in quotes
+may span lines; `$XDG_CONFIG_HOME` replaces `~/.config`). Variables set in the environment win
+over the file. Without an argument and with `AGENT_ADDRESS` already in the environment (Docker,
+systemd `EnvironmentFile=`), no file is read.
 
 **Demo mode**: leave `A2A_URL` unset to test a guardian before connecting the agent. It then
 prints the text of every authenticated mail and replies `Echo: <text>` itself; `A2A_TOKEN` and

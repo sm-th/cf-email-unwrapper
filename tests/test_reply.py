@@ -93,8 +93,22 @@ async def test_completed_reply_is_encrypted_signed_and_threaded(pki, replier, ou
     assert msg.get_param("smime-type") == "enveloped-data"
 
     content = pki.open_reply(raw, recipient=pki.author_enc)
-    text = email.message_from_bytes(content, policy=email.policy.default).get_content()
-    assert text.strip() == "Die Antwort"
+    body = email.message_from_bytes(content, policy=email.policy.default)
+    assert body.get_content_type() == "multipart/alternative"
+    assert body.get_body(("plain",)).get_content().strip() == "Die Antwort"
+
+
+async def test_markdown_is_rendered_to_html_and_raw_html_is_escaped(pki, replier, outbox, state):
+    submit(state, reply_cert=pki.author_enc.cert_pem)
+    markdown = "# Plan\n\n- **one**\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n<script>x()</script>"
+    await replier.reply_to_task(make_task(TaskState.TASK_STATE_COMPLETED, artifact_text=markdown))
+    raw, _ = parse(outbox.pushed[0])
+    body = email.message_from_bytes(pki.open_reply(raw, recipient=pki.author_enc),
+                                    policy=email.policy.default)
+    assert body.get_body(("plain",)).get_content().replace("\r\n", "\n").strip() == markdown
+    html = body.get_body(("html",)).get_content()
+    assert "<h1>Plan</h1>" in html and "<strong>one</strong>" in html and "<td>1</td>" in html
+    assert "<script>" not in html and "&lt;script&gt;" in html
 
 
 async def test_reply_signature_carries_the_bot_encryption_certificate(pki, replier, outbox, state):

@@ -12,6 +12,7 @@ dependencies = [
     "asn1crypto>=1.5.1",
     "html2text>=2025.4.15",
     "httpx>=0.28.1",
+    "markdown-it-py>=4.2.0",
     "python-dotenv>=1.2.4",
     "starlette>=1.10.0",
     "uvicorn>=0.54.0",

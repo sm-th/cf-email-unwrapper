@@ -82,6 +82,11 @@ lost during downtime does not lose the reply.
 
 ### Quoted history
 
+Replies quote the mail they answer: below the agent text an attribution line
+(`On <date>, <author> wrote:`) and the author's new text, without its own quoted history, as `> `
+lines in text/plain and a `<blockquote type="cite">` in text/html. The decrypted text is kept in
+the state file only until the task gets its final reply.
+
 The agent already has the conversation in its A2A context, so the quoted history a mail client
 appends is trimmed before the text is sent. The parent of a mail is the first Message-ID in its
 `In-Reply-To`: one of our replies (whose Message-IDs are stored with their task), a mail of the

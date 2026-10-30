@@ -540,3 +540,23 @@ async def test_reply_to_an_older_agent_reply_keeps_one_quote_level(pki, gateway,
                     References=f"<q1@example.com> {older} <q2@example.com>")
     assert own["referenceTaskIds"] == ["task-2"]
     assert own["parts"][0]["text"].endswith("\n\n> And tomorrow?")
+
+
+async def test_reply_quotes_the_question_and_an_answer_to_it_drops_the_quote(
+    pki, gateway, agent, start
+):
+    unwrapper = await start()
+    await ask(pki, gateway, agent, "What is the weather?", Message_ID="<q1@example.com>")
+    reply_id = await answer(unwrapper, gateway, agent, "task-1", "Sunny.")
+    reply = email.message_from_bytes(pki.open_reply(gateway.sent[-1][1], recipient=pki.author_enc),
+                                     policy=email.policy.default)
+    shown = reply.get_body(("plain",)).get_content().replace("\r\n", "\n").strip()
+    assert shown.startswith("Sunny.") and shown.endswith("wrote:\n\n> What is the weather?")
+
+    # The author answers the reply, quoting all of it as mail clients do.
+    quoted = "\n".join(f"> {line}".rstrip() for line in shown.splitlines())
+    message = await ask(pki, gateway, agent,
+                        f"And tomorrow?\n\nOn Fri, 30 Oct 2026 at 18:12, {BOT} wrote:\n\n{quoted}",
+                        Message_ID="<q2@example.com>", In_Reply_To=reply_id,
+                        References=f"<q1@example.com> {reply_id}")
+    assert message["parts"] == [{"text": "And tomorrow?"}]

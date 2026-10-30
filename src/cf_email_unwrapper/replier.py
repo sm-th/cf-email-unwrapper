@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 from a2a.types.a2a_pb2 import Message, Task, TaskState
 
-from .mail import compose_reply, reply_message_id, text_entity
+from .mail import Quote, compose_reply, reply_message_id, text_entity
 from .smime import Smime
 from .state import Mail, State
 
@@ -106,7 +106,8 @@ class Replier:
         return message_id, raw
 
     def _compose(self, mail: Mail, message_id: str, text: str, urgent: bool) -> bytes:
-        sealed = self._smime.seal(text_entity(text), mail.reply_cert_pem)
+        quote = Quote(author=mail.author, date=mail.date, text=mail.quote) if mail.quote else None
+        sealed = self._smime.seal(text_entity(text, quote), mail.reply_cert_pem)
         return compose_reply(
             sealed,
             agent_address=self._agent_address,

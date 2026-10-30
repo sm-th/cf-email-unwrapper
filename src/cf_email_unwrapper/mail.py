@@ -2,9 +2,11 @@
 
 import email.policy
 import hashlib
+import html
 import re
+from dataclasses import dataclass
 from email.message import EmailMessage, Message
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parsedate_to_datetime
 from enum import Enum
 
 import html2text
@@ -155,18 +157,46 @@ blockquote {{ margin-left: 0; padding-left: 10px; border-left: 3px solid #ccc; c
 """
 
 
-def render_html(markdown: str) -> str:
-    return _HTML_PAGE.format(body=_MARKDOWN.render(markdown))
+@dataclass(frozen=True)
+class Quote:
+    """The author's mail, quoted below the agent's answer."""
+
+    author: str
+    date: str | None  # Date header of the quoted mail
+    text: str
+
+    def attribution(self) -> str:
+        try:
+            when = parsedate_to_datetime(self.date) if self.date else None
+        except (TypeError, ValueError):
+            when = None
+        if when is None:
+            return f"{self.author} wrote:"
+        return f"On {when:%a, %d %b %Y at %H:%M}, {self.author} wrote:"
+
+    def plain(self) -> str:
+        lines = [f"> {line}".rstrip() for line in self.text.splitlines()]
+        return f"{self.attribution()}\n\n" + "\n".join(lines)
+
+    def html(self) -> str:
+        body = html.escape(self.text).replace("\n", "<br>\n")
+        return (f"<p>{html.escape(self.attribution())}</p>\n"
+                f'<blockquote type="cite">{body}</blockquote>\n')
 
 
-def text_entity(text: str) -> bytes:
+def text_entity(text: str, quote: Quote | None = None) -> bytes:
     """A multipart/alternative MIME entity (headers + body) ready to be signed.
 
     ``text`` is the agent's Markdown: sent as written in text/plain and rendered in text/html.
+    ``quote`` is appended below it in both parts.
     """
+    plain, body = text, _MARKDOWN.render(text)
+    if quote is not None:
+        plain = f"{text}\n\n{quote.plain()}\n"
+        body = f"{body}<br>\n{quote.html()}"
     part = EmailMessage()
-    part.set_content(text, charset="utf-8", cte="quoted-printable")
-    part.add_alternative(render_html(text), subtype="html", charset="utf-8",
+    part.set_content(plain, charset="utf-8", cte="quoted-printable")
+    part.add_alternative(_HTML_PAGE.format(body=body), subtype="html", charset="utf-8",
                          cte="quoted-printable")
     del part["MIME-Version"]
     return part.as_bytes(policy=email.policy.SMTP)

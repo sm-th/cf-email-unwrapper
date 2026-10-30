@@ -87,6 +87,7 @@ class Worker:
             log.info("%s was already handed to the agent; skipping the redelivery", message_id)
             return
         context = context_id(thread_root(outer, message_id))
+        text = extract_text(opened.content)
         mail = Mail(
             message_id=message_id,
             author=opened.sender,
@@ -94,6 +95,8 @@ class Worker:
             references=str(outer.get("References", "")),
             reply_cert_pem=opened.reply_cert_pem,
             context_id=context,
+            quote=trim_quotes(text, QuoteTrim.FULL),
+            date=str(outer.get("Date", "")) or None,
         )
         # Which mail this one answers: one of our replies, or a mail of the author we delivered.
         in_reply_to = message_ids(outer.get("In-Reply-To"))
@@ -103,7 +106,7 @@ class Worker:
         # The agent already knows its latest reply; any other quoted mail tells it what is answered.
         mode = QuoteTrim.FULL if parent and parent.latest_reply else QuoteTrim.ONE_LEVEL
         response = await self._agent.send(
-            text=trim_quotes(extract_text(opened.content), mode),
+            text=trim_quotes(text, mode),
             message_id=a2a_message_id(message_id),
             context_id=context,
             reference_task_ids=[parent.task_id] if parent and parent.task_id else [],

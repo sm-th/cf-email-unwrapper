@@ -10,7 +10,16 @@ from email.message import EmailMessage
 from .agent import AgentClient
 from .config import Config
 from .gateway import InboundMail
-from .mail import a2a_message_id, context_id, extract_text, own_message_id, thread_root
+from .mail import (
+    QuoteTrim,
+    a2a_message_id,
+    context_id,
+    extract_text,
+    message_ids,
+    own_message_id,
+    thread_root,
+    trim_quotes,
+)
 from .replier import REPLY_STATES, Replier
 from .smime import Opened, Rejected, Smime
 from .state import Mail, State
@@ -77,19 +86,27 @@ class Worker:
         if self._state.delivered(message_id):
             log.info("%s was already handed to the agent; skipping the redelivery", message_id)
             return
+        context = context_id(thread_root(outer, message_id))
         mail = Mail(
             message_id=message_id,
             author=opened.sender,
             subject=str(outer.get("Subject", "")),
             references=str(outer.get("References", "")),
             reply_cert_pem=opened.reply_cert_pem,
+            context_id=context,
         )
+        # Which mail this one answers: one of our replies, or a mail of the author we delivered.
+        in_reply_to = message_ids(outer.get("In-Reply-To"))
+        parent = self._state.parent(in_reply_to[0]) if in_reply_to else None
         self._state.record_mail(mail)
 
+        # The agent already knows its latest reply; any other quoted mail tells it what is answered.
+        mode = QuoteTrim.FULL if parent and parent.latest_reply else QuoteTrim.ONE_LEVEL
         response = await self._agent.send(
-            text=extract_text(opened.content),
+            text=trim_quotes(extract_text(opened.content), mode),
             message_id=a2a_message_id(message_id),
-            context_id=context_id(thread_root(outer, message_id)),
+            context_id=context,
+            reference_task_ids=[parent.task_id] if parent and parent.task_id else [],
             push_url=self._cfg.push_url,
             push_token=self._cfg.push_token,
         )

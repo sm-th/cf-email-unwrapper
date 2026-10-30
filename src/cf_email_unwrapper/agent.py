@@ -31,6 +31,7 @@ class AgentClient:
         text: str,
         message_id: str,
         context_id: str,
+        reference_task_ids: list[str],
         push_url: str | None,
         push_token: str | None,
     ) -> SendMessageResponse:
@@ -39,6 +40,7 @@ class AgentClient:
             context_id=context_id,
             role=Role.ROLE_USER,
             parts=[Part(text=text)],
+            reference_task_ids=reference_task_ids,
         )
         request = SendMessageRequest(
             message=message,
@@ -64,6 +66,7 @@ class EchoAgent:
         text: str,
         message_id: str,
         context_id: str,
+        reference_task_ids: list[str],
         push_url: str | None,
         push_token: str | None,
     ) -> SendMessageResponse:

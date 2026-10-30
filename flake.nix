@@ -1,5 +1,5 @@
 {
-  description = "S/MIME email <-> A2A bridge for one agent (Cloudflare Queues + R2)";
+  description = "S/MIME email <-> A2A bridge for one agent (cf-email-gateway WebSocket)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

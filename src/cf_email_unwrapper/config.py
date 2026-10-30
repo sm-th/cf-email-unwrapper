@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 _PEM_BLOCK = re.compile(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", re.S)
 
@@ -28,14 +29,23 @@ def parse_duration(value: str) -> float:
     return float(value)
 
 
+_WS_SCHEMES = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}
+
+
+def mailbox_url(gateway_url: str, address: str) -> str:
+    """WebSocket URL of the gateway mailbox for ``address`` (``<GATEWAY_URL>/mailbox/<address>``)."""
+    parts = urlsplit(gateway_url.strip())
+    scheme = _WS_SCHEMES.get(parts.scheme.lower())
+    if scheme is None or not parts.netloc:
+        raise ValueError(f"GATEWAY_URL: expected an http(s) or ws(s) URL, got {gateway_url!r}")
+    path = parts.path.rstrip("/") + "/mailbox/" + quote(address, safe="")
+    return urlunsplit((scheme, parts.netloc, path, "", ""))
+
+
 @dataclass(frozen=True)
 class Config:
-    cf_account_id: str
-    cf_api_token: str
-    r2_endpoint: str
-    r2_access_key_id: str
-    r2_secret_access_key: str
-    r2_bucket: str
+    mailbox_url: str
+    gateway_token: str
     agent_address: str
     bot_signing_key_pem: str
     bot_signing_cert_pem: str
@@ -49,9 +59,7 @@ class Config:
     push_port: int
     push_url: str
     push_token: str
-    outbox_queue: str
     max_signature_age: float
-    poll_interval: float
     openssl: str
     state_path: str
 
@@ -65,7 +73,6 @@ class Config:
                 raise ValueError(f"missing environment variable {name}")
             return value
 
-        account_id = required("CF_ACCOUNT_ID")
         agent_address = required("AGENT_ADDRESS").lower()
         state_home = env.get("XDG_STATE_HOME") or os.path.join(
             env.get("HOME") or os.path.expanduser("~"), ".local", "state"
@@ -74,12 +81,8 @@ class Config:
         push_port = int(env.get("PUSH_PORT", "8090"))
         url_host = "127.0.0.1" if push_host in ("0.0.0.0", "::") else push_host
         return cls(
-            cf_account_id=account_id,
-            cf_api_token=required("CF_API_TOKEN"),
-            r2_endpoint=env.get("R2_ENDPOINT") or f"https://{account_id}.r2.cloudflarestorage.com",
-            r2_access_key_id=required("R2_ACCESS_KEY_ID"),
-            r2_secret_access_key=required("R2_SECRET_ACCESS_KEY"),
-            r2_bucket=env.get("R2_BUCKET") or "email-agents",
+            mailbox_url=mailbox_url(required("GATEWAY_URL"), agent_address),
+            gateway_token=required("GATEWAY_TOKEN"),
             agent_address=agent_address,
             bot_signing_key_pem=read_pem("BOT_SIGNING_KEY_FILE", required("BOT_SIGNING_KEY_FILE")),
             bot_signing_cert_pem=read_pem("BOT_SIGNING_CERT_FILE", required("BOT_SIGNING_CERT_FILE")),
@@ -95,9 +98,7 @@ class Config:
             push_port=push_port,
             push_url=env.get("PUSH_URL") or f"http://{url_host}:{push_port}/a2a/push",
             push_token=required("PUSH_TOKEN"),
-            outbox_queue=env.get("OUTBOX_QUEUE") or "email-outbox",
             max_signature_age=parse_duration(env.get("MAX_SIGNATURE_AGE") or "1h"),
-            poll_interval=parse_duration(env.get("POLL_INTERVAL") or "5"),
             openssl=env.get("OPENSSL") or "openssl",
             state_path=env.get("STATE_PATH")
             or os.path.join(state_home, "cf-email-unwrapper", f"{agent_address}.sqlite3"),

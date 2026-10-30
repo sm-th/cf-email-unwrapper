@@ -1,62 +1,107 @@
-"""Queue -> R2 -> S/MIME -> A2A -> push notification -> outbox, with HTTP mocked at the transport."""
+"""Gateway WebSocket -> S/MIME -> A2A -> push notification -> outbox -> gateway.
 
-import base64
+The gateway is a real local WebSocket server implementing the mailbox contract; the agent is
+mocked at the HTTP transport.
+"""
+
+import asyncio
+import contextlib
 import email
 import email.policy
+import hashlib
+import hmac
 import json
+import uuid
+from urllib.parse import quote
 
 import httpx
 import pytest
 from conftest import AUTHOR, BOT, OPENSSL, mail_headers
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 from cf_email_unwrapper.agent import AgentClient
-from cf_email_unwrapper.cloudflare import Queues
-from cf_email_unwrapper.config import Config
+from cf_email_unwrapper.config import Config, mailbox_url
+from cf_email_unwrapper.gateway import Gateway, decode_frame, encode_frame
+from cf_email_unwrapper.outbox import Sender
 from cf_email_unwrapper.push import TOKEN_HEADER, create_app
 from cf_email_unwrapper.replier import Replier
 from cf_email_unwrapper.state import State
 from cf_email_unwrapper.worker import Worker
 
-INBOUND_ID, OUTBOX_ID = "q-inbound", "q-outbox"
 PUSH_URL = "http://127.0.0.1:8090/a2a/push"
+PUSH_TOKEN = "stable-push-secret"
+GATEWAY_SECRET = b"gateway-secret"
+GATEWAY_TOKEN = hmac.new(GATEWAY_SECRET, BOT.encode(), hashlib.sha256).hexdigest()
+FAST = 0.05  # retry and reconnect delays in tests
 
 
-class FakeCloudflare:
-    """Queues REST API: list, pull (base64 JSON bodies like the real API), ack, push."""
+class FakeGateway:
+    """The mailbox Durable Object of cf-email-gateway, for one address."""
 
     def __init__(self):
-        self.pending: list[dict] = []
-        self.acks: list[dict] = []
-        self.outbox: list[dict] = []
+        self.mails: dict[str, tuple[dict, bytes]] = {}  # stored until acked, oldest first
+        self.acked: list[str] = []
+        self.sends: list[dict] = []  # every send frame header received
+        self.sent: list[tuple[str, bytes]] = []  # (to, raw) handed to send_email
+        self.send_errors = 0  # answer this many upcoming sends with an error
+        self.connections = 0
+        self.socket: ServerConnection | None = None
 
-    def enqueue(self, body: dict) -> None:
-        encoded = base64.b64encode(json.dumps(body).encode()).decode()
-        self.pending.append({"id": f"m{len(self.pending)}", "lease_id": f"lease-{len(self.pending)}",
-                             "attempts": 1, "body": encoded, "timestamp_ms": 0})
+    async def __aenter__(self):
+        self.server = await serve(self.handler, "127.0.0.1", 0, process_request=self.check,
+                                  max_size=None)
+        port = self.server.sockets[0].getsockname()[1]
+        self.url = f"http://127.0.0.1:{port}"
+        return self
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        assert request.headers["authorization"] == "Bearer cf-token"
-        path = request.url.path.removeprefix("/client/v4/accounts/acct/queues")
-        if request.method == "GET" and path == "":
-            queues = [{"queue_id": INBOUND_ID, "queue_name": "mail-hermes-example-org"},
-                      {"queue_id": OUTBOX_ID, "queue_name": "email-outbox"}]
-            return self.ok(queues, result_info={"page": 1, "total_pages": 1})
-        body = json.loads(request.content)
-        if path == f"/{INBOUND_ID}/messages/pull":
-            messages, self.pending = self.pending, []
-            return self.ok({"messages": messages})
-        if path == f"/{INBOUND_ID}/messages/ack":
-            self.acks.append(body)
-            return self.ok({})
-        if path == f"/{OUTBOX_ID}/messages":
-            assert body["content_type"] == "json"
-            self.outbox.append(body["body"])
-            return self.ok(None)
-        return httpx.Response(404, json={"success": False, "errors": [{"message": path}]})
+    async def __aexit__(self, *exc):
+        self.server.close()
+        await self.server.wait_closed()
 
-    @staticmethod
-    def ok(result, **extra) -> httpx.Response:
-        return httpx.Response(200, json={"success": True, "errors": [], "result": result, **extra})
+    def check(self, connection, request):
+        if request.path != "/mailbox/" + quote(BOT, safe=""):
+            return connection.respond(404, "not found\n")
+        expected = f"Bearer {GATEWAY_TOKEN}"
+        if not hmac.compare_digest(request.headers.get("Authorization", ""), expected):
+            return connection.respond(401, "unauthorized\n")
+        return None
+
+    async def handler(self, ws: ServerConnection) -> None:
+        if self.socket is not None:
+            await self.socket.close(4000, "replaced")
+        self.socket = ws
+        self.connections += 1
+        for header, raw in list(self.mails.values()):
+            await ws.send(encode_frame(header, raw))
+        with contextlib.suppress(ConnectionClosed):
+            async for message in ws:
+                if isinstance(message, str):
+                    frame = json.loads(message)
+                    assert frame["type"] == "ack"
+                    if self.mails.pop(frame["id"], None) is not None:
+                        self.acked.append(frame["id"])
+                    continue
+                header, raw = decode_frame(message)
+                assert header["type"] == "send"
+                self.sends.append(header)
+                if self.send_errors:
+                    self.send_errors -= 1
+                    reply = {"type": "error", "id": header["id"], "message": "send_email failed"}
+                else:
+                    self.sent.append((header["to"], raw))
+                    reply = {"type": "sent", "id": header["id"]}
+                await ws.send(json.dumps(reply))
+
+    async def deliver(self, raw: bytes) -> str:
+        mail_id = str(uuid.uuid4())
+        header = {"type": "mail", "id": mail_id, "from": AUTHOR, "to": BOT,
+                  "receivedAt": "2026-10-29T08:00:00.000Z", "size": len(raw)}
+        self.mails[mail_id] = (header, raw)
+        if self.socket is not None:
+            with contextlib.suppress(ConnectionClosed):
+                await self.socket.send(encode_frame(header, raw))
+        return mail_id
 
 
 class FakeAgent:
@@ -65,10 +110,12 @@ class FakeAgent:
     def __init__(self):
         self.tasks: dict[str, dict] = {}
         self.requests: list[dict] = []
+        self.attempts = 0
         self.unavailable = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer a2a-token"
+        self.attempts += 1
         if self.unavailable:
             return httpx.Response(503)
         rpc = json.loads(request.content)
@@ -95,45 +142,55 @@ class FakeAgent:
         self.tasks[task_id]["status"] = {"state": "TASK_STATE_COMPLETED"}
         self.tasks[task_id]["artifacts"] = [{"artifactId": "a1", "parts": [{"text": text}]}]
 
-
-class FakeR2:
-    def __init__(self):
-        self.objects: dict[str, bytes] = {}
-
-    def get(self, key):
-        return self.objects.get(key)
-
-    def delete(self, key):
-        self.objects.pop(key, None)
+    def methods(self) -> list[str]:
+        return [r["method"] for r in self.requests]
 
 
-PUSH_TOKEN = "stable-push-secret"
-
-
-def start_unwrapper(pki, cf, agent, r2, state_path, **env):
-    """One unwrapper process: fresh Config, clients, state connection and push app."""
-    config = Config.from_env({
-        "CF_ACCOUNT_ID": "acct", "CF_API_TOKEN": "cf-token", "R2_ENDPOINT": "http://r2",
-        "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s", "AGENT_ADDRESS": BOT,
+def load_config(pki, gateway_url, state_path, **env) -> Config:
+    return Config.from_env({
+        "GATEWAY_URL": gateway_url, "GATEWAY_TOKEN": GATEWAY_TOKEN, "AGENT_ADDRESS": BOT,
         "BOT_SIGNING_KEY_FILE": str(pki.bot_sign.key), "BOT_SIGNING_CERT_FILE": str(pki.bot_sign.cert),
         "BOT_ENCRYPTION_KEY_FILE": str(pki.bot_enc.key),
         "BOT_ENCRYPTION_CERT_FILE": str(pki.bot_enc.cert), "CA_CERT_FILE": str(pki.ca.cert),
         "ALLOWED_SENDERS": AUTHOR, "A2A_URL": "http://agent/", "A2A_TOKEN": "a2a-token",
-        "PUSH_URL": PUSH_URL, "PUSH_TOKEN": PUSH_TOKEN, "POLL_INTERVAL": "0.01",
-        "OPENSSL": OPENSSL, "STATE_PATH": str(state_path), **env,
+        "PUSH_URL": PUSH_URL, "PUSH_TOKEN": PUSH_TOKEN, "OPENSSL": OPENSSL,
+        "STATE_PATH": str(state_path), **env,
     })
-    queues = Queues("acct", "cf-token", httpx.AsyncClient(transport=httpx.MockTransport(cf.handler)))
-    a2a = AgentClient(config.a2a_url, config.a2a_token,
-                      httpx.AsyncClient(transport=httpx.MockTransport(agent.handler)))
-    smime = pki.smime()
-    state = State(config.state_path)
-    replier = Replier(queues=queues, outbox_queue="email-outbox", smime=smime, agent_address=BOT,
-                      state=state)
-    worker = Worker(config=config, queues=queues, store=r2, smime=smime, agent=a2a,
-                    replier=replier, state=state)
-    app = create_app(token=config.push_token, agent=a2a, replier=replier)
-    push = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://push")
-    return config, worker, push
+
+
+class Unwrapper:
+    """One unwrapper process: fresh config, clients, state, gateway connection and push app."""
+
+    def __init__(self, pki, gateway_url, agent, state_path):
+        self.config = load_config(pki, gateway_url, state_path)
+        a2a = AgentClient(self.config.a2a_url, self.config.a2a_token,
+                          httpx.AsyncClient(transport=httpx.MockTransport(agent.handler)))
+        smime = pki.smime()
+        self.state = State(self.config.state_path)
+        self.sender = Sender(self.state, retry_delay=FAST)
+        replier = Replier(smime=smime, agent_address=BOT, state=self.state,
+                          on_queued=self.sender.wake)
+        self.worker = Worker(config=self.config, smime=smime, agent=a2a, replier=replier,
+                             state=self.state, retry_delay=FAST)
+        self.gateway = Gateway(self.config.mailbox_url, self.config.gateway_token,
+                               on_mail=self.worker.handle, on_connect=self.sender.wake,
+                               min_delay=FAST, max_delay=FAST)
+        app = create_app(token=self.config.push_token, agent=a2a, replier=replier)
+        self.push = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://push")
+        self._tasks = [asyncio.create_task(self.gateway.run()),
+                       asyncio.create_task(self.sender.run(self.gateway))]
+
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self.state.close()
+
+
+async def eventually(condition, timeout: float = 10) -> None:
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.01)
 
 
 @pytest.fixture
@@ -142,27 +199,47 @@ def state_path(tmp_path):
 
 
 @pytest.fixture
-def bridge(pki, state_path):
-    cf, agent, r2 = FakeCloudflare(), FakeAgent(), FakeR2()
-    config, worker, push = start_unwrapper(pki, cf, agent, r2, state_path)
-    return cf, agent, r2, config, worker, push
+async def gateway():
+    async with FakeGateway() as gateway:
+        yield gateway
 
 
-def deliver(cf, r2, raw: bytes, key: str) -> None:
-    r2.objects[key] = raw
-    cf.enqueue({"version": 1, "r2Key": key, "from": AUTHOR, "to": BOT,
-                "receivedAt": "2026-10-29T08:00:00.000Z", "size": len(raw)})
+@pytest.fixture
+def agent():
+    return FakeAgent()
 
 
-async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
-    cf, agent, r2, config, worker, push = bridge
-    key = "mail-hermes-example-org/1.eml"
+@pytest.fixture
+async def start(pki, gateway, agent, state_path):
+    started: list[Unwrapper] = []
+
+    async def start_unwrapper() -> Unwrapper:
+        unwrapper = Unwrapper(pki, gateway.url, agent, state_path)
+        started.append(unwrapper)
+        await eventually(lambda: unwrapper.gateway.connected)
+        return unwrapper
+
+    yield start_unwrapper
+    for unwrapper in started:
+        with contextlib.suppress(Exception):
+            await unwrapper.stop()
+
+
+def test_mailbox_url_maps_the_scheme_and_encodes_the_address():
+    assert (mailbox_url("https://gw.example.workers.dev/", "a+b@example.org")
+            == "wss://gw.example.workers.dev/mailbox/a%2Bb%40example.org")
+    assert mailbox_url("http://127.0.0.1:8787", BOT) == "ws://127.0.0.1:8787/mailbox/hermes%40example.org"
+    assert mailbox_url("wss://gw/base", BOT) == "wss://gw/base/mailbox/hermes%40example.org"
+    with pytest.raises(ValueError, match="GATEWAY_URL"):
+        mailbox_url("ftp://gw", BOT)
+
+
+async def test_mail_round_trip_produces_exactly_one_reply(pki, gateway, agent, start):
+    unwrapper = await start()
     raw = pki.seal("What is the weather?", signer=pki.author_sign, extra_certs=[pki.author_enc_rsa],
                    headers=mail_headers(Subject="Weather", **{"Message-ID": "<q1@example.com>"}))
-    deliver(cf, r2, raw, key)
-
-    queue_id = await worker.wait_for_queue()
-    assert await worker.poll_once(queue_id) == 1
+    mail_id = await gateway.deliver(raw)
+    await eventually(lambda: gateway.acked == [mail_id])
 
     [send] = agent.requests
     assert send["method"] == "SendMessage"
@@ -171,94 +248,144 @@ async def test_mail_round_trip_produces_exactly_one_reply(pki, bridge):
     assert message["parts"] == [{"text": "What is the weather?"}]
     assert "metadata" not in message  # the email context stays in the unwrapper
     assert configuration["returnImmediately"] is True
-    assert configuration["taskPushNotificationConfig"] == {"url": PUSH_URL, "token": config.push_token}
-    # Accepted: acknowledged and removed from R2, nothing replied yet.
-    assert cf.acks == [{"acks": [{"lease_id": "lease-0"}], "retries": []}]
-    assert key not in r2.objects and cf.outbox == []
+    assert configuration["taskPushNotificationConfig"] == {"url": PUSH_URL, "token": PUSH_TOKEN}
+    assert gateway.mails == {} and gateway.sends == []
 
     notification = {"statusUpdate": {"taskId": "task-1", "contextId": message["contextId"],
                                      "status": {"state": "TASK_STATE_COMPLETED"}}}
-    forged = await push.post("/a2a/push", json=notification, headers={TOKEN_HEADER: "wrong"})
+    forged = await unwrapper.push.post("/a2a/push", json=notification, headers={TOKEN_HEADER: "wrong"})
     assert forged.status_code == 401
 
     agent.complete("task-1", "Sunny.")
     for _ in range(2):  # duplicate notification
-        resp = await push.post("/a2a/push", json=notification,
-                               headers={TOKEN_HEADER: config.push_token})
+        resp = await unwrapper.push.post("/a2a/push", json=notification,
+                                         headers={TOKEN_HEADER: PUSH_TOKEN})
         assert resp.status_code == 200
 
-    [outgoing] = cf.outbox
-    assert (outgoing["from"], outgoing["to"]) == (BOT, AUTHOR)
-    reply = base64.b64decode(outgoing["raw"])
+    await eventually(lambda: unwrapper.state.outbox() == [] and gateway.sent)
+    [(to, reply)] = gateway.sent
+    assert to == AUTHOR
     headers = email.message_from_bytes(reply, policy=email.policy.default)
     assert headers["Subject"] == "Re: Weather"
     assert headers["In-Reply-To"] == "<q1@example.com>"
     content = pki.open_reply(reply, recipient=pki.author_enc_rsa)
     assert b"Sunny." in content
+    await asyncio.sleep(0.2)
+    assert len(gateway.sends) == 1
 
 
-async def test_task_finished_while_down_is_answered_once_after_restart(pki, bridge, state_path):
-    cf, agent, r2, _, worker, _ = bridge
+async def test_task_finished_while_down_is_answered_once_after_restart(
+    pki, gateway, agent, start, state_path
+):
+    unwrapper = await start()
     raw = pki.seal("Long job", signer=pki.author_sign, extra_certs=[pki.author_enc],
                    headers=mail_headers(**{"Message-ID": "<long@example.com>"}))
-    deliver(cf, r2, raw, "k.eml")
-    await worker.poll_once(INBOUND_ID)
-    await worker.recover()  # still running: nothing to answer
-    assert cf.outbox == []
+    mail_id = await gateway.deliver(raw)
+    await eventually(lambda: gateway.acked == [mail_id])
+    await unwrapper.worker.recover()  # still running: nothing to answer
+    assert unwrapper.state.outbox() == []
+    await unwrapper.stop()
 
     # The agent finishes while the unwrapper is down, so its notification is lost.
     agent.complete("task-1", "Finished.")
-    _, restarted, restarted_push = start_unwrapper(pki, cf, agent, r2, state_path)
-    await restarted.recover()
-    [outgoing] = cf.outbox
-    reply = base64.b64decode(outgoing["raw"])
+    restarted = await start()
+    await restarted.worker.recover()
+    await eventually(lambda: gateway.sent)
+    [(_, reply)] = gateway.sent
     assert email.message_from_bytes(reply)["In-Reply-To"] == "<long@example.com>"
     assert b"Finished." in pki.open_reply(reply, recipient=pki.author_enc)
 
     # A late notification and another restart do not answer again.
-    resp = await restarted_push.post(
+    resp = await restarted.push.post(
         "/a2a/push", json={"task": {"id": "task-1"}}, headers={TOKEN_HEADER: PUSH_TOKEN}
     )
     assert resp.status_code == 200
-    _, again, _ = start_unwrapper(pki, cf, agent, r2, state_path)
-    await again.recover()
-    assert len(cf.outbox) == 1
-    assert [r["method"] for r in agent.requests].count("GetTask") == 3  # the last recover skips the closed task
+    await restarted.stop()
+    again = await start()
+    await again.worker.recover()
+    await asyncio.sleep(0.2)
+    assert len(gateway.sent) == 1 and again.state.outbox() == []
+    assert agent.methods().count("GetTask") == 3  # the last recover skips the closed task
 
     with pytest.raises(ValueError, match="PUSH_TOKEN"):
-        start_unwrapper(pki, cf, agent, r2, state_path, PUSH_TOKEN="  ")
+        load_config(pki, gateway.url, state_path, PUSH_TOKEN="  ")
+    with pytest.raises(ValueError, match="GATEWAY_TOKEN"):
+        load_config(pki, gateway.url, state_path, GATEWAY_TOKEN="")
     with pytest.raises(ValueError, match="CA_CERT_FILE: cannot read"):
-        start_unwrapper(pki, cf, agent, r2, state_path, CA_CERT_FILE=str(state_path) + ".missing")
+        load_config(pki, gateway.url, state_path, CA_CERT_FILE=str(state_path) + ".missing")
 
 
-async def test_redelivered_mail_reaches_the_agent_once(pki, bridge):
-    cf, agent, r2, _, worker, _ = bridge
+async def test_duplicate_mail_reaches_the_agent_once(pki, gateway, agent, start):
+    await start()
     raw = pki.seal("hi", signer=pki.author_sign, headers=mail_headers())
-    deliver(cf, r2, raw, "first.eml")
-    deliver(cf, r2, raw, "again.eml")  # the queue delivers at least once
+    # The gateway received the same email twice; both copies arrive at once.
+    first, again = await gateway.deliver(raw), await gateway.deliver(raw)
 
-    assert await worker.poll_once(INBOUND_ID) == 2
-    assert [r["method"] for r in agent.requests] == ["SendMessage"]
-    assert len(cf.acks) == 2 and r2.objects == {}
-
-
-async def test_unauthenticated_mail_is_dropped_without_reply(pki, bridge):
-    cf, agent, r2, _, worker, _ = bridge
-    key = "mail-hermes-example-org/2.eml"
-    deliver(cf, r2, pki.seal("hi", signer=pki.mallory_sign, headers=mail_headers()), key)
-
-    assert await worker.poll_once(INBOUND_ID) == 1
-    assert agent.requests == []
-    assert cf.acks == [{"acks": [{"lease_id": "lease-0"}], "retries": []}]
-    assert key not in r2.objects and cf.outbox == []
+    await eventually(lambda: sorted(gateway.acked) == sorted([first, again]))
+    assert agent.methods() == ["SendMessage"]
 
 
-async def test_agent_failure_retries_and_keeps_the_mail(pki, bridge):
-    cf, agent, r2, _, worker, _ = bridge
+async def test_unauthenticated_mail_is_acked_without_reply(pki, gateway, agent, start):
+    await start()
+    mail_id = await gateway.deliver(pki.seal("hi", signer=pki.mallory_sign, headers=mail_headers()))
+
+    await eventually(lambda: gateway.acked == [mail_id])
+    assert agent.attempts == 0 and gateway.sends == []
+
+
+async def test_unavailable_agent_is_retried_before_the_ack(pki, gateway, agent, start):
+    await start()
     agent.unavailable = True
-    key = "mail-hermes-example-org/3.eml"
-    deliver(cf, r2, pki.seal("hi", signer=pki.author_sign, headers=mail_headers()), key)
+    mail_id = await gateway.deliver(pki.seal("hi", signer=pki.author_sign, headers=mail_headers()))
 
-    await worker.poll_once(INBOUND_ID)
-    assert cf.acks == [{"acks": [], "retries": [{"lease_id": "lease-0", "delay_seconds": 30}]}]
-    assert key in r2.objects
+    await eventually(lambda: agent.attempts >= 3)
+    assert gateway.acked == [] and mail_id in gateway.mails
+
+    agent.unavailable = False
+    await eventually(lambda: gateway.acked == [mail_id])
+    assert agent.methods() == ["SendMessage"]
+
+
+async def test_gateway_error_keeps_the_reply_for_a_retry(pki, gateway, agent, start):
+    unwrapper = await start()
+    mail_id = await gateway.deliver(pki.seal("hi", signer=pki.author_sign, headers=mail_headers()))
+    await eventually(lambda: gateway.acked == [mail_id])
+
+    gateway.send_errors = 1
+    agent.complete("task-1", "Answer.")
+    resp = await unwrapper.push.post("/a2a/push", json={"task": {"id": "task-1"}},
+                                     headers={TOKEN_HEADER: PUSH_TOKEN})
+    assert resp.status_code == 200  # stored locally
+
+    await eventually(lambda: len(gateway.sends) == 1)
+    await eventually(lambda: [r.attempts for r in unwrapper.state.outbox()] == [1])
+    await eventually(lambda: unwrapper.state.outbox() == [])
+    assert len(gateway.sends) == 2 and len(gateway.sent) == 1
+    assert gateway.sends[0]["id"] == gateway.sends[1]["id"]
+
+
+async def test_reconnect_resends_unacked_mail_and_continues(pki, gateway, agent, start):
+    unwrapper = await start()
+    agent.unavailable = True
+    stuck = await gateway.deliver(pki.seal("one", signer=pki.author_sign, headers=mail_headers()))
+    await eventually(lambda: agent.attempts >= 1)
+
+    await gateway.socket.close(1011, "restarting")
+    await eventually(lambda: gateway.connections == 2 and unwrapper.gateway.connected)
+
+    agent.unavailable = False
+    await eventually(lambda: gateway.acked == [stuck])
+    fresh = await gateway.deliver(pki.seal("two", signer=pki.author_sign, headers=mail_headers()))
+    await eventually(lambda: gateway.acked == [stuck, fresh])
+    # The resent copy of the stuck mail was not handled a second time.
+    assert agent.methods() == ["SendMessage", "SendMessage"]
+
+
+async def test_wrong_token_is_rejected(pki, gateway, agent):
+    client = Gateway(mailbox_url(gateway.url, BOT), "0" * 64, on_mail=None, min_delay=FAST,
+                     max_delay=FAST)
+    task = asyncio.create_task(client.run())
+    await asyncio.sleep(0.3)
+    assert gateway.connections == 0 and not client.connected
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)

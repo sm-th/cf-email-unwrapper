@@ -2,18 +2,19 @@
 
 A small Python service that runs next to one A2A agent and lets trusted people talk to it by
 S/MIME email. It is the second half of an email ↔ A2A bridge; the first half is
-`cf-email-gateway`, a Cloudflare Worker that receives mail, stores it in R2, queues a reference
-and sends the replies this service produces.
+`cf-email-gateway`, a Cloudflare Worker that receives mail, keeps it in one mailbox Durable Object
+per agent address and sends the replies this service produces. This service connects to its
+mailbox over a WebSocket.
 
 ```
-author ──S/MIME──▶ Email Routing ─▶ gateway ─▶ R2 + queue mail-<slug>
-                                                    │ (HTTP pull)
-                                                    ▼
+author ──S/MIME──▶ Email Routing ─▶ gateway ─▶ mailbox Durable Object (per address)
+                                                    ▲ │
+                                     send / ack     │ │ mail
+                                                    │ ▼  (WebSocket)
                           agent ◀──A2A SendMessage── unwrapper (this repo)
                             │                         ▲
                             └──push notification──────┘
-                                                      │ signed (+ encrypted) reply
-author ◀── send_email ◀── gateway ◀── queue email-outbox
+author ◀── send_email ◀── gateway ◀── signed (+ encrypted) reply
 ```
 
 The gateway has no keys and checks nothing; this service holds the bot key and performs every
@@ -21,11 +22,10 @@ S/MIME check. The agent only speaks plain A2A.
 
 ## What it does
 
-1. Looks up its inbound queue `mail-<slug>` (derived from `AGENT_ADDRESS`, see
-   [Queue naming](#queue-naming)). The gateway creates the queue on the first email, so until
-   then the service keeps polling for it.
-2. Pulls batches over the Cloudflare Queues HTTP pull API and, for each message, reads the raw
-   `.eml` from R2 (S3 API).
+1. Connects to `<GATEWAY_URL>/mailbox/<AGENT_ADDRESS>` (see [Gateway protocol](#gateway-protocol))
+   and keeps the connection open, reconnecting with backoff (1 s doubling to 60 s). On every
+   connection the gateway sends all stored mail, oldest first, then new mail as it arrives.
+2. Handles each mail in its own task, so a slow agent never blocks receiving.
 3. Opens the message with the OpenSSL CLI:
    - decrypts `application/pkcs7-mime` enveloped data with the bot encryption certificate and key
      (RSA key transport, PKCS#1 v1.5 or OAEP, or EC key agreement; signed-but-unencrypted mail is
@@ -40,8 +40,8 @@ S/MIME check. The agent only speaks plain A2A.
      signature: issued for the author's address, an RSA key with keyUsage `keyEncipherment` or an
      EC key with keyUsage `keyAgreement`, chains to `CA_CERT_FILE` (`openssl verify`). The most recently
      issued match wins.
-4. Rejected mail is logged, acknowledged and deleted from R2. Unauthenticated senders never get a
-   reply.
+4. Rejected mail is logged and acknowledged, which deletes it from the mailbox. Unauthenticated
+   senders never get a reply.
 5. Authenticated mail is sent to the agent with A2A `SendMessage` (non-blocking,
    `returnImmediately: true`) with a push notification config pointing to this service's push URL
    and the configured `PUSH_TOKEN`. The message text is the email's `text/plain` body, or its HTML
@@ -49,10 +49,10 @@ S/MIME check. The agent only speaks plain A2A.
    reply (author, subject, Message-ID, References, reply certificate) is stored in the local state
    file under the task id.
 
-   Once the agent has accepted the task, the queue message is acknowledged and the R2 object
-   deleted. If the agent cannot be reached, the queue message is retried after 30 s and the R2
-   object is kept. A redelivered message whose Message-ID the agent already accepted is
-   acknowledged without a second `SendMessage`.
+   Once the agent has accepted the task, the mail is acknowledged. If the agent cannot be reached,
+   the mail is not acknowledged and delivery is retried every 30 s until it succeeds; if the
+   process stops meanwhile, the gateway sends the mail again on the next connection. A mail whose
+   Message-ID the agent already accepted is acknowledged without a second `SendMessage`.
 6. When the agent sends a push notification, the service checks the `X-A2A-Notification-Token`
    header, fetches the task with `GetTask` and replies only for the states `completed`,
    `input-required`, `failed`, `rejected` and `canceled`, using the email context from the state
@@ -62,10 +62,14 @@ S/MIME check. The agent only speaks plain A2A.
    then encrypted with AES-256 for the author's reply certificate when one was found (OpenSSL
    defaults: RSA PKCS#1 v1.5 key transport, or for EC the ECDH KDF
    `dhSinglePass-stdDH-sha1kdf-scheme`, which iOS Mail requires). Without a reply certificate the
-   reply is signed only. The finished message is pushed to `email-outbox` as
-   `{"version": 1, "from", "to", "raw": "<base64>"}`; the push endpoint returns 200 only after that
-   succeeded, otherwise 502 so the agent may retry. Replies whose JSON would exceed 120 KB are
-   replaced by a short notice.
+   reply is signed only. Replies larger than 20 MB are replaced by a short notice.
+8. The finished reply is stored in the local outbox in the same transaction that records the
+   (task, state) answer; the push endpoint then returns 200 (502 if the task could not be fetched
+   or the reply not stored, so the agent may retry). A sender sends due outbox entries over the
+   WebSocket whenever it is connected (right after each connection and whenever a reply is
+   stored) and deletes an entry once the gateway reports it `sent`. On an `error` or no answer
+   within 60 s the entry is retried after 30 s, doubling up to 1 h; an entry still failing after
+   24 h is dropped with an error log.
 
 Each (task, state) pair is answered at most once, also across restarts. On startup the service
 fetches every task that has not reached a final reply (`completed`, `failed`, `rejected`,
@@ -75,8 +79,17 @@ lost during downtime does not lose the reply.
 ### State
 
 One SQLite file per instance (`STATE_PATH`) holds the email context of every mail handed to the
-agent and the replies sent. Keep it on persistent storage; losing it loses the replies for tasks
-still running and the protection against answering twice. Rows are not pruned.
+agent, the replies made and the outbox of replies not yet confirmed by the gateway. Keep it on
+persistent storage; losing it loses the replies for tasks still running, unsent replies and the
+protection against answering twice. Mail and reply rows are not pruned; outbox rows are deleted
+once sent or dropped.
+
+### Delivery guarantees
+
+The gateway delivers mail at least once: a mail stays in the mailbox until this service
+acknowledges it and is sent again on the next connection otherwise. Duplicates are recognised by
+Message-ID, so each email reaches the agent once. Replies are at least once as well: a reply whose
+`sent` confirmation was lost (connection drop, timeout) is sent again.
 
 ### Threads and ids
 
@@ -97,19 +110,28 @@ still running and the protection against answering twice. Rows are not pruned.
 - Text only: attachments are ignored inbound, and replies are a single `text/plain` part.
 - Every email starts a new A2A task in the thread's context; replies to an `input-required`
   question are not attached to the waiting task.
-- A reply is recorded after it was pushed to the outbox; a crash between the two can send it twice.
 
-## Queue naming
+## Gateway protocol
 
-Must match the gateway exactly:
+`GET /mailbox/<percent-encoded address>` with `Authorization: Bearer <GATEWAY_TOKEN>`, upgraded to
+a WebSocket. The token is the lowercase hex HMAC-SHA256 of the lowercased address under the
+gateway's `GATEWAY_SECRET`:
 
-1. `a = address.trim().lower()`
-2. `slug` = `a` with every run of characters outside `[a-z0-9]` replaced by `-`, leading/trailing
-   `-` removed
-3. `name = "mail-" + slug`
-4. if `len(name) > 63`: `name = name[:54].rstrip("-") + "-" + sha256_hex(a)[:8]`
+```sh
+printf %s hermes@example.org | openssl dgst -sha256 -hmac "$GATEWAY_SECRET" -r | cut -d' ' -f1
+```
 
-`hermes@example.org` → `mail-hermes-example-org`.
+Binary frames are a UTF-8 JSON header, a newline (`\n`) and raw bytes.
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| gateway → unwrapper | binary `{"type":"mail","id","from","to","receivedAt","size"}` + raw `.eml` | A stored mail |
+| unwrapper → gateway | text `{"type":"ack","id"}` | Mail handled; the gateway deletes it |
+| unwrapper → gateway | binary `{"type":"send","id","to"}` + raw reply `.eml` | Send a reply from the agent address |
+| gateway → unwrapper | text `{"type":"sent","id"}` or `{"type":"error","id","message"}` | Result of a `send` |
+
+The gateway keeps one connection per mailbox; a new connection replaces the old one (close code
+4000). The unwrapper sends WebSocket pings every 20 s.
 
 ## Configuration
 
@@ -117,13 +139,9 @@ Environment variables only.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `CF_ACCOUNT_ID` | yes | | Cloudflare account id |
-| `CF_API_TOKEN` | yes | | API token with Queues read + write (pull, ack, push to outbox) |
-| `R2_ENDPOINT` | no | `https://<CF_ACCOUNT_ID>.r2.cloudflarestorage.com` | R2 S3 endpoint |
-| `R2_ACCESS_KEY_ID` | yes | | R2 S3 access key id (read + delete on the bucket) |
-| `R2_SECRET_ACCESS_KEY` | yes | | R2 S3 secret |
-| `R2_BUCKET` | no | `email-agents` | Bucket holding the raw messages |
-| `AGENT_ADDRESS` | yes | | The agent's email address; also selects the inbound queue |
+| `GATEWAY_URL` | yes | | Gateway Worker URL, e.g. `https://cf-email-gateway.example.workers.dev` (`http`/`https`/`ws`/`wss`) |
+| `GATEWAY_TOKEN` | yes | | Mailbox token for `AGENT_ADDRESS` (see [Gateway protocol](#gateway-protocol)) |
+| `AGENT_ADDRESS` | yes | | The agent's email address; selects the mailbox |
 | `BOT_SIGNING_KEY_FILE` | yes | | Path to the bot signing private key (unencrypted PEM) |
 | `BOT_SIGNING_CERT_FILE` | yes | | Path to the bot signing certificate (PEM) |
 | `BOT_ENCRYPTION_KEY_FILE` | yes | | Path to the bot encryption private key (unencrypted PEM) |
@@ -136,9 +154,7 @@ Environment variables only.
 | `PUSH_PORT` | no | `8090` | Port of the push endpoint |
 | `PUSH_URL` | no | `http://<PUSH_HOST>:<PUSH_PORT>/a2a/push` (`127.0.0.1` when bound to a wildcard) | URL the agent posts notifications to |
 | `PUSH_TOKEN` | yes | | Shared secret the agent echoes in `X-A2A-Notification-Token`; generate once (e.g. `openssl rand -hex 32`) and keep it across restarts |
-| `OUTBOX_QUEUE` | no | `email-outbox` | Outbox queue name |
 | `MAX_SIGNATURE_AGE` | no | `1h` | Maximum signingTime age; seconds or `s`/`m`/`h` suffix |
-| `POLL_INTERVAL` | no | `5` | Pause between empty pulls; seconds or `s`/`m`/`h` suffix |
 | `OPENSSL` | no | `openssl` | Path to an OpenSSL 3 binary (LibreSSL is not supported) |
 | `STATE_PATH` | no | `$XDG_STATE_HOME/cf-email-unwrapper/<AGENT_ADDRESS>.sqlite3` (`~/.local/state` without `XDG_STATE_HOME`) | SQLite state file; parent directories are created |
 
@@ -176,8 +192,8 @@ uv run pytest
 
 The tests create a throwaway EC P-256 PKI (CA, author signing and encryption certificates, bot
 certificate, a second untrusted CA) with the configured OpenSSL, seal test mail with
-`openssl cms -sign | openssl cms -encrypt`, and run the whole loop against a mocked Cloudflare API,
-an in-memory R2 and a fake A2A agent.
+`openssl cms -sign | openssl cms -encrypt`, and run the whole loop against a local WebSocket server
+implementing the gateway mailbox protocol and a fake A2A agent.
 
 ## Implementation notes
 
@@ -189,4 +205,4 @@ an in-memory R2 and a fake A2A agent.
   `TASK_STATE_COMPLETED`). The agent URL is configured directly, so no agent card is fetched.
 - Push notifications follow the a2a-sdk sender: a POST of a `StreamResponse` JSON object with the
   config token in `X-A2A-Notification-Token`. The task is always re-read with `GetTask`.
-- Pull consumers receive `json` queue bodies base64-encoded; they are decoded before use.
+- The gateway connection uses the `websockets` library without a message size limit.

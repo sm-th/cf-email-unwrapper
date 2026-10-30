@@ -187,6 +187,14 @@ set -a; . ./unwrapper.env; set +a
 nix run github:sm-th/cf-email-unwrapper
 ```
 
+To test a guardian before connecting the real agent, run the echo agent next to it and set
+`A2A_URL=http://127.0.0.1:8800/` (any `A2A_TOKEN`). It prints every message it receives and
+answers `Echo: <text>` through a push notification (`ECHO_PORT` changes the port):
+
+```sh
+nix run github:sm-th/cf-email-unwrapper#echo-agent
+```
+
 From a checkout:
 
 ```sh

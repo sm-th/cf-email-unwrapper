@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,8 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 log = logging.getLogger(__name__)
+
+_MESSAGE_ID = re.compile(r"<[^<>@\s]+@[^<>\s]+>")
 
 SIGNATURE_HEADER = "X-Mailbox-Signature"
 
@@ -180,7 +183,9 @@ class Gateway:
         kind, frame_id = frame.get("type"), frame.get("id")
         future = self._pending.get(frame_id) if isinstance(frame_id, str) else None
         if kind == "sent" and future and not future.done():
-            future.set_result(None)
+            delivered = frame.get("messageId")
+            future.set_result(delivered if isinstance(delivered, str)
+                              and _MESSAGE_ID.fullmatch(delivered) else None)
         elif kind == "error" and future and not future.done():
             future.set_exception(GatewayError(str(frame.get("message"))))
         elif kind == "error":
@@ -188,8 +193,11 @@ class Gateway:
         else:
             log.warning("ignoring gateway frame %s for %s", kind, frame_id)
 
-    async def send(self, id: str, to: str, raw: bytes) -> None:
-        """Send ``raw`` to ``to`` through the gateway; raises GatewayError unless it reports sent."""
+    async def send(self, id: str, to: str, raw: bytes) -> str | None:
+        """Send ``raw`` to ``to`` through the gateway; raises GatewayError unless it reports sent.
+
+        Returns the Message-ID the mail was delivered with, if the gateway reports one.
+        """
         ws = self._ws
         if ws is None:
             raise GatewayError("not connected")
@@ -204,7 +212,7 @@ class Gateway:
                 raise GatewayError(f"gateway connection lost: {e}") from e
             try:
                 async with asyncio.timeout(self._send_timeout):
-                    await future
+                    return await future
             except TimeoutError:
                 raise GatewayError(f"no answer to send {id}") from None
         finally:

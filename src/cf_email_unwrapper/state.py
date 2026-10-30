@@ -92,9 +92,18 @@ class State:
         self._db = sqlite3.connect(path, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
-        columns = {row[1] for row in self._db.execute("PRAGMA table_info(mails)")}
-        if "context_id" not in columns:  # state files from before the column existed
-            self._db.execute("ALTER TABLE mails ADD COLUMN context_id TEXT")
+        # State files from before these columns existed.
+        self._add_column("mails", "context_id TEXT")
+        # Cloudflare replaces the Message-ID of sent mail; the one the recipient sees.
+        self._add_column("reply_mails", "delivered_id TEXT")
+        self._add_column("outbox", "message_id TEXT")
+        self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reply_mails_delivered"
+                         " ON reply_mails (delivered_id)")
+
+    def _add_column(self, table: str, column: str) -> None:
+        columns = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+        if column.split()[0] not in columns:
+            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
 
     def close(self) -> None:
         self._db.close()
@@ -133,10 +142,10 @@ class State:
     def parent(self, message_id: str) -> Parent | None:
         """What ``message_id`` is to us: one of our replies, a mail we delivered, or unknown."""
         row = self._db.execute(
-            "SELECT r.task_id, r.context_id IS NOT NULL AND r.message_id = ("
-            "  SELECT message_id FROM reply_mails WHERE context_id = r.context_id"
+            "SELECT r.task_id, r.context_id IS NOT NULL AND r.rowid = ("
+            "  SELECT rowid FROM reply_mails WHERE context_id = r.context_id"
             "  ORDER BY sent_at DESC, rowid DESC LIMIT 1)"
-            " FROM reply_mails r WHERE r.message_id = ?",
+            " FROM reply_mails r WHERE r.message_id = ?1 OR r.delivered_id = ?1",
             (message_id,),
         ).fetchone()
         if row:
@@ -197,9 +206,9 @@ class State:
         recipient = mail.author
         now = datetime.now(UTC).timestamp()
         self._db.execute(
-            "INSERT INTO outbox (id, recipient, raw, created_at, next_attempt_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), recipient, raw, now, now),
+            "INSERT INTO outbox (id, recipient, raw, created_at, next_attempt_at, message_id)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), recipient, raw, now, now, message_id),
         )
 
     def outbox(self) -> list[OutboxReply]:
@@ -219,5 +228,14 @@ class State:
             (next_attempt_at, reply_id),
         )
 
-    def remove_reply(self, reply_id: str) -> None:
-        self._db.execute("DELETE FROM outbox WHERE id = ?", (reply_id,))
+    def remove_reply(self, reply_id: str, *, delivered_id: str | None = None) -> None:
+        """Drop a queued reply; ``delivered_id`` is the Message-ID it was delivered with."""
+        with self._db:
+            self._db.execute("BEGIN")
+            if delivered_id:
+                self._db.execute(
+                    "UPDATE OR IGNORE reply_mails SET delivered_id = ?"
+                    " WHERE message_id = (SELECT message_id FROM outbox WHERE id = ?)",
+                    (delivered_id, reply_id),
+                )
+            self._db.execute("DELETE FROM outbox WHERE id = ?", (reply_id,))

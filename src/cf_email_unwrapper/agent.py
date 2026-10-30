@@ -31,8 +31,8 @@ class AgentClient:
         text: str,
         message_id: str,
         context_id: str,
-        push_url: str,
-        push_token: str,
+        push_url: str | None,
+        push_token: str | None,
     ) -> SendMessageResponse:
         message = Message(
             message_id=message_id,
@@ -53,3 +53,28 @@ class AgentClient:
 
     async def get_task(self, task_id: str) -> Task:
         return await self._transport.get_task(GetTaskRequest(id=task_id))
+
+
+class EchoAgent:
+    """Demo mode stand-in for an agent: prints each message and answers ``Echo: <text>``."""
+
+    async def send(
+        self,
+        *,
+        text: str,
+        message_id: str,
+        context_id: str,
+        push_url: str | None,
+        push_token: str | None,
+    ) -> SendMessageResponse:
+        print(f"\n--- demo mode: message {message_id} ---\n{text}\n---", flush=True)
+        reply = Message(
+            message_id=f"echo-{message_id}",
+            context_id=context_id,
+            role=Role.ROLE_AGENT,
+            parts=[Part(text=f"Echo: {text}")],
+        )
+        return SendMessageResponse(message=reply)
+
+    async def get_task(self, task_id: str) -> Task:
+        raise RuntimeError(f"demo mode has no agent to ask about task {task_id}")

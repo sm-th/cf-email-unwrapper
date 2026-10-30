@@ -168,12 +168,12 @@ Environment variables only.
 | `BOT_ENCRYPTION_CERT_FILE` | yes | | Path to the bot encryption certificate (PEM); inbound mail is encrypted to it |
 | `CA_CERT_FILE` | yes | | Path to the trusted CA certificate(s) (PEM) |
 | `ALLOWED_SENDERS` | yes | | Comma or whitespace separated author addresses |
-| `A2A_URL` | yes | | Agent JSON-RPC endpoint (e.g. `http://127.0.0.1:8000/`) |
-| `A2A_TOKEN` | yes | | Bearer token for the agent |
+| `A2A_URL` | no | | Agent JSON-RPC endpoint (e.g. `http://127.0.0.1:8000/`); unset = demo mode (echo replies) |
+| `A2A_TOKEN` | with `A2A_URL` | | Bearer token for the agent |
 | `PUSH_HOST` | no | `127.0.0.1` | Bind address of the push endpoint |
 | `PUSH_PORT` | no | `8090` | Port of the push endpoint |
 | `PUSH_URL` | no | `http://<PUSH_HOST>:<PUSH_PORT>/a2a/push` (`127.0.0.1` when bound to a wildcard) | URL the agent posts notifications to |
-| `PUSH_TOKEN` | yes | | Shared secret the agent echoes in `X-A2A-Notification-Token`; generate once (e.g. `openssl rand -hex 32`) and keep it across restarts |
+| `PUSH_TOKEN` | with `A2A_URL` | | Shared secret the agent echoes in `X-A2A-Notification-Token`; generate once (e.g. `openssl rand -hex 32`) and keep it across restarts |
 | `MAX_SIGNATURE_AGE` | no | `1h` | Maximum signingTime age; seconds or `s`/`m`/`h` suffix |
 | `OPENSSL` | no | `openssl` | Path to an OpenSSL 3 binary (LibreSSL is not supported) |
 | `STATE_PATH` | no | `$XDG_STATE_HOME/cf-email-unwrapper/<AGENT_ADDRESS>.sqlite3` (`~/.local/state` without `XDG_STATE_HOME`) | SQLite state file; parent directories are created |
@@ -187,13 +187,10 @@ set -a; . ./unwrapper.env; set +a
 nix run github:sm-th/cf-email-unwrapper
 ```
 
-To test a guardian before connecting the real agent, run the echo agent next to it and set
-`A2A_URL=http://127.0.0.1:8800/` (any `A2A_TOKEN`). It prints every message it receives and
-answers `Echo: <text>` through a push notification (`ECHO_PORT` changes the port):
-
-```sh
-nix run github:sm-th/cf-email-unwrapper#echo-agent
-```
+**Demo mode**: leave `A2A_URL` unset to test a guardian before connecting the agent. It then
+prints the text of every authenticated mail and replies `Echo: <text>` itself; `A2A_TOKEN` and
+`PUSH_TOKEN` are not needed and no push endpoint is started. Mail answered in demo mode is not
+handed to the agent later.
 
 From a checkout:
 

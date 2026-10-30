@@ -1,4 +1,4 @@
-"""S/MIME open/seal through the OpenSSL CLI.
+"""S/MIME open/seal and the gateway mailbox signature, through the OpenSSL CLI.
 
 All cryptographic operations run in ``openssl cms`` / ``openssl verify``.
 ``asn1crypto`` is only used to read certificate fields and CMS signed
@@ -23,6 +23,11 @@ from asn1crypto import cms, pem, x509
 log = logging.getLogger(__name__)
 
 _FUTURE_SKEW = timedelta(minutes=5)
+
+
+def mailbox_challenge(address: str) -> bytes:
+    """The content signed to open the gateway mailbox of ``address`` (see README)."""
+    return f"cf-email-gateway mailbox v1\n{address.strip().lower()}\n".encode()
 
 
 class Rejected(Exception):
@@ -278,3 +283,18 @@ class Smime:
             self._run(d, "cms", "-encrypt", "-aes256", "-in", "signed.eml",
                       "-outform", "SMIME", "-out", "encrypted.eml", "recip.pem")
             return (d / "encrypted.eml").read_bytes()
+
+    def sign_mailbox_challenge(self, address: str) -> bytes:
+        """Detached DER CMS signature of ``mailbox_challenge(address)`` with the bot signing key.
+
+        It embeds the signing certificate and a signingTime, so it must be fresh on every
+        connection attempt.
+        """
+        with _workdir() as d:
+            _put(d / "challenge", mailbox_challenge(address))
+            _put(d / "bot.pem", self._signing_cert)
+            _put(d / "bot.key", self._signing_key)
+            self._run(d, "cms", "-sign", "-binary", "-md", "sha256", "-outform", "DER",
+                      "-in", "challenge", "-signer", "bot.pem", "-inkey", "bot.key",
+                      "-out", "sig.der")
+            return (d / "sig.der").read_bytes()

@@ -33,8 +33,8 @@ async def main() -> None:
     replier = Replier(smime=smime, agent_address=cfg.agent_address, state=state,
                       on_queued=sender.wake)
     worker = Worker(config=cfg, smime=smime, agent=agent, replier=replier, state=state)
-    gateway = Gateway(cfg.mailbox_url, cfg.gateway_token, on_mail=worker.handle,
-                      on_connect=sender.wake)
+    gateway = Gateway(cfg.mailbox_url, lambda: smime.sign_mailbox_challenge(cfg.agent_address),
+                      on_mail=worker.handle, on_connect=sender.wake)
     server = uvicorn.Server(
         uvicorn.Config(
             create_app(token=cfg.push_token, agent=agent, replier=replier),

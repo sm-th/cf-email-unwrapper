@@ -5,24 +5,29 @@ mocked at the HTTP transport.
 """
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import email
 import email.policy
-import hashlib
-import hmac
 import json
+import subprocess
+import tempfile
 import uuid
-from urllib.parse import quote
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import unquote
 
 import httpx
 import pytest
+from asn1crypto import cms
 from conftest import AUTHOR, BOT, OPENSSL, mail_headers
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from cf_email_unwrapper.agent import AgentClient
 from cf_email_unwrapper.config import Config, mailbox_url
-from cf_email_unwrapper.gateway import Gateway, decode_frame, encode_frame
+from cf_email_unwrapper.gateway import SIGNATURE_HEADER, Gateway, decode_frame, encode_frame
 from cf_email_unwrapper.outbox import Sender
 from cf_email_unwrapper.push import TOKEN_HEADER, create_app
 from cf_email_unwrapper.replier import Replier
@@ -31,21 +36,53 @@ from cf_email_unwrapper.worker import Worker
 
 PUSH_URL = "http://127.0.0.1:8090/a2a/push"
 PUSH_TOKEN = "stable-push-secret"
-GATEWAY_SECRET = b"gateway-secret"
-GATEWAY_TOKEN = hmac.new(GATEWAY_SECRET, BOT.encode(), hashlib.sha256).hexdigest()
+MAILBOX_PREFIX = "/mailbox/"
 FAST = 0.05  # retry and reconnect delays in tests
+
+
+def mailbox_signature_error(ca_cert: Path, address: str, header: str) -> str | None:
+    """Why ``header`` does not open the mailbox of ``address``, checked like cf-email-gateway."""
+    try:
+        der = base64.b64decode(header, validate=True)
+    except binascii.Error:
+        return "signature is not base64"
+    with tempfile.TemporaryDirectory() as d:
+        work = Path(d)
+        (work / "sig.der").write_bytes(der)
+        (work / "challenge").write_bytes(f"cf-email-gateway mailbox v1\n{address}\n".encode())
+        verify = subprocess.run(
+            [OPENSSL, "cms", "-verify", "-binary", "-inform", "DER", "-in", "sig.der",
+             "-content", "challenge", "-CAfile", str(ca_cert), "-purpose", "smimesign",
+             "-signer", "signer.pem", "-out", "/dev/null"],
+            cwd=work, capture_output=True)
+        if verify.returncode != 0:
+            return f"verification failed: {verify.stderr.decode(errors='replace').strip()}"
+        emails = subprocess.run([OPENSSL, "x509", "-in", "signer.pem", "-noout", "-email"],
+                                cwd=work, capture_output=True, check=True).stdout.decode()
+    if address not in {e.strip().lower() for e in emails.splitlines()}:
+        return f"signer certificate is not for {address}: {emails.split()}"
+    signer_infos = list(cms.ContentInfo.load(der)["content"]["signer_infos"])
+    if len(signer_infos) != 1:
+        return f"expected exactly one signer, found {len(signer_infos)}"
+    times = [a["values"][0].native for a in signer_infos[0]["signed_attrs"]
+             if a["type"].native == "signing_time"]
+    if not times or abs(times[0] - datetime.now(UTC)) > timedelta(minutes=5):
+        return f"signingTime missing or off by more than 5 minutes: {times}"
+    return None
 
 
 class FakeGateway:
     """The mailbox Durable Object of cf-email-gateway, for one address."""
 
-    def __init__(self):
+    def __init__(self, ca_cert: Path):
+        self.ca_cert = ca_cert
         self.mails: dict[str, tuple[dict, bytes]] = {}  # stored until acked, oldest first
         self.acked: list[str] = []
         self.sends: list[dict] = []  # every send frame header received
         self.sent: list[tuple[str, bytes]] = []  # (to, raw) handed to send_email
         self.send_errors = 0  # answer this many upcoming sends with an error
         self.connections = 0
+        self.rejected: list[str] = []  # reasons of refused connection attempts
         self.socket: ServerConnection | None = None
 
     async def __aenter__(self):
@@ -59,11 +96,14 @@ class FakeGateway:
         self.server.close()
         await self.server.wait_closed()
 
-    def check(self, connection, request):
-        if request.path != "/mailbox/" + quote(BOT, safe=""):
+    async def check(self, connection, request):
+        address = unquote(request.path.removeprefix(MAILBOX_PREFIX)).strip().lower()
+        if not request.path.startswith(MAILBOX_PREFIX) or address != BOT:
             return connection.respond(404, "not found\n")
-        expected = f"Bearer {GATEWAY_TOKEN}"
-        if not hmac.compare_digest(request.headers.get("Authorization", ""), expected):
+        error = await asyncio.to_thread(mailbox_signature_error, self.ca_cert, address,
+                                        request.headers.get(SIGNATURE_HEADER, ""))
+        if error is not None:
+            self.rejected.append(error)
             return connection.respond(401, "unauthorized\n")
         return None
 
@@ -148,7 +188,7 @@ class FakeAgent:
 
 def load_config(pki, gateway_url, state_path, **env) -> Config:
     return Config.from_env({
-        "GATEWAY_URL": gateway_url, "GATEWAY_TOKEN": GATEWAY_TOKEN, "AGENT_ADDRESS": BOT,
+        "GATEWAY_URL": gateway_url, "AGENT_ADDRESS": BOT,
         "BOT_SIGNING_KEY_FILE": str(pki.bot_sign.key), "BOT_SIGNING_CERT_FILE": str(pki.bot_sign.cert),
         "BOT_ENCRYPTION_KEY_FILE": str(pki.bot_enc.key),
         "BOT_ENCRYPTION_CERT_FILE": str(pki.bot_enc.cert), "CA_CERT_FILE": str(pki.ca.cert),
@@ -161,18 +201,19 @@ def load_config(pki, gateway_url, state_path, **env) -> Config:
 class Unwrapper:
     """One unwrapper process: fresh config, clients, state, gateway connection and push app."""
 
-    def __init__(self, pki, gateway_url, agent, state_path):
+    def __init__(self, pki, gateway_url, agent, state_path, signing=None):
         self.config = load_config(pki, gateway_url, state_path)
         a2a = AgentClient(self.config.a2a_url, self.config.a2a_token,
                           httpx.AsyncClient(transport=httpx.MockTransport(agent.handler)))
-        smime = pki.smime()
+        smime = pki.smime(signing)
         self.state = State(self.config.state_path)
         self.sender = Sender(self.state, retry_delay=FAST)
         replier = Replier(smime=smime, agent_address=BOT, state=self.state,
                           on_queued=self.sender.wake)
         self.worker = Worker(config=self.config, smime=smime, agent=a2a, replier=replier,
                              state=self.state, retry_delay=FAST)
-        self.gateway = Gateway(self.config.mailbox_url, self.config.gateway_token,
+        self.gateway = Gateway(self.config.mailbox_url,
+                               lambda: smime.sign_mailbox_challenge(self.config.agent_address),
                                on_mail=self.worker.handle, on_connect=self.sender.wake,
                                min_delay=FAST, max_delay=FAST)
         app = create_app(token=self.config.push_token, agent=a2a, replier=replier)
@@ -199,8 +240,8 @@ def state_path(tmp_path):
 
 
 @pytest.fixture
-async def gateway():
-    async with FakeGateway() as gateway:
+async def gateway(pki):
+    async with FakeGateway(pki.ca.cert) as gateway:
         yield gateway
 
 
@@ -309,8 +350,8 @@ async def test_task_finished_while_down_is_answered_once_after_restart(
 
     with pytest.raises(ValueError, match="PUSH_TOKEN"):
         load_config(pki, gateway.url, state_path, PUSH_TOKEN="  ")
-    with pytest.raises(ValueError, match="GATEWAY_TOKEN"):
-        load_config(pki, gateway.url, state_path, GATEWAY_TOKEN="")
+    with pytest.raises(ValueError, match="BOT_SIGNING_CERT_FILE"):
+        load_config(pki, gateway.url, state_path, BOT_SIGNING_CERT_FILE="")
     with pytest.raises(ValueError, match="CA_CERT_FILE: cannot read"):
         load_config(pki, gateway.url, state_path, CA_CERT_FILE=str(state_path) + ".missing")
 
@@ -381,11 +422,13 @@ async def test_reconnect_resends_unacked_mail_and_continues(pki, gateway, agent,
     assert agent.methods() == ["SendMessage", "SendMessage"]
 
 
-async def test_wrong_token_is_rejected(pki, gateway, agent):
-    client = Gateway(mailbox_url(gateway.url, BOT), "0" * 64, on_mail=None, min_delay=FAST,
-                     max_delay=FAST)
-    task = asyncio.create_task(client.run())
-    await asyncio.sleep(0.3)
-    assert gateway.connections == 0 and not client.connected
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+async def test_signing_cert_for_another_address_is_refused(pki, gateway, agent, state_path):
+    await gateway.deliver(pki.seal("Hello agent", headers=mail_headers(), signer=pki.author_sign))
+    unwrapper = Unwrapper(pki, gateway.url, agent, state_path, signing=pki.stranger_sign)
+    try:
+        await eventually(lambda: len(gateway.rejected) >= 3)  # it keeps reconnecting
+        assert all("not for hermes@example.org" in r for r in gateway.rejected)
+        assert gateway.connections == 0 and not unwrapper.gateway.connected
+        assert len(gateway.mails) == 1 and agent.attempts == 0
+    finally:
+        await unwrapper.stop()

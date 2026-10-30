@@ -1,11 +1,14 @@
 """WebSocket client for the cf-email-gateway mailbox (see README, "Gateway protocol").
 
-Binary frames are a UTF-8 JSON header, a newline and raw bytes. The gateway pushes ``mail``
-frames; the client answers ``ack`` (text) once a mail is handled and sends replies as ``send``
-frames, which the gateway confirms with ``sent`` or ``error``.
+Every connection attempt carries a fresh ``X-Mailbox-Signature``: a detached CMS signature of
+the mailbox challenge made with the bot signing key. Binary frames are a UTF-8 JSON header, a
+newline and raw bytes. The gateway pushes ``mail`` frames; the client answers ``ack`` (text)
+once a mail is handled and sends replies as ``send`` frames, which the gateway confirms with
+``sent`` or ``error``.
 """
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -16,6 +19,8 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
 log = logging.getLogger(__name__)
+
+SIGNATURE_HEADER = "X-Mailbox-Signature"
 
 
 class GatewayError(Exception):
@@ -45,14 +50,16 @@ def decode_frame(data: bytes) -> tuple[dict[str, Any], bytes]:
 class Gateway:
     """One connection to the agent's mailbox, re-established with backoff.
 
-    ``on_mail`` runs in its own task per mail and returns True when the mail may be acknowledged.
-    ``on_connect`` is called after every successful (re)connection.
+    ``sign`` returns a fresh DER CMS signature of the mailbox challenge; it runs in a thread
+    before every connection attempt. ``on_mail`` runs in its own task per mail and returns True
+    when the mail may be acknowledged. ``on_connect`` is called after every successful
+    (re)connection.
     """
 
     def __init__(
         self,
         url: str,
-        token: str,
+        sign: Callable[[], bytes],
         *,
         on_mail: Callable[[InboundMail], Awaitable[bool]],
         on_connect: Callable[[], None] = lambda: None,
@@ -62,7 +69,7 @@ class Gateway:
         max_delay: float = 60,
     ):
         self._url = url
-        self._token = token
+        self._sign = sign
         self._on_mail = on_mail
         self._on_connect = on_connect
         self._send_timeout = send_timeout
@@ -84,9 +91,10 @@ class Gateway:
         try:
             while True:
                 try:
+                    signature = await asyncio.to_thread(self._sign)
                     async with connect(
                         self._url,
-                        additional_headers={"Authorization": f"Bearer {self._token}"},
+                        additional_headers={SIGNATURE_HEADER: base64.b64encode(signature).decode()},
                         max_size=None,
                         ping_interval=self._ping_interval,
                     ) as ws:
@@ -102,7 +110,7 @@ class Gateway:
                     log.warning("lost the gateway connection: %s", e)
                 except (OSError, TimeoutError) as e:
                     log.warning("cannot connect to the gateway: %s", e)
-                except Exception as e:  # e.g. InvalidStatus for a rejected token
+                except Exception as e:  # e.g. InvalidStatus for a rejected signature
                     log.error("gateway connection failed: %s", e)
                 finally:
                     self._disconnected()

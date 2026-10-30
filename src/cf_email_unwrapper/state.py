@@ -57,6 +57,8 @@ class Mail:
     references: str
     reply_cert_pem: str | None
     context_id: str | None = None  # A2A context the mail was sent in
+    quote: str | None = None  # the author's new text, quoted in replies until the final one
+    date: str | None = None  # the mail's Date header, for the quote attribution
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,8 @@ class State:
         self._db.executescript(_SCHEMA)
         # State files from before these columns existed.
         self._add_column("mails", "context_id TEXT")
+        self._add_column("mails", "quote TEXT")
+        self._add_column("mails", "date TEXT")
         # Cloudflare replaces the Message-ID of sent mail; the one the recipient sees.
         self._add_column("reply_mails", "delivered_id TEXT")
         self._add_column("outbox", "message_id TEXT")
@@ -120,12 +124,13 @@ class State:
         """Store the context before the agent sees the mail; a retry overwrites it."""
         self._db.execute(
             "INSERT INTO mails (message_id, author, subject, refs, reply_cert_pem, context_id,"
-            " received_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " quote, date, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (message_id) DO UPDATE SET author = excluded.author,"
             " subject = excluded.subject, refs = excluded.refs,"
-            " reply_cert_pem = excluded.reply_cert_pem, context_id = excluded.context_id",
+            " reply_cert_pem = excluded.reply_cert_pem, context_id = excluded.context_id,"
+            " quote = excluded.quote, date = excluded.date",
             (mail.message_id, mail.author, mail.subject, mail.references, mail.reply_cert_pem,
-             mail.context_id, _now()),
+             mail.context_id, mail.quote, mail.date, _now()),
         )
 
     def attach_task(self, message_id: str, task_id: str) -> None:
@@ -133,8 +138,8 @@ class State:
 
     def mail_for_task(self, task_id: str) -> Mail | None:
         row = self._db.execute(
-            "SELECT message_id, author, subject, refs, reply_cert_pem, context_id FROM mails"
-            " WHERE task_id = ?",
+            "SELECT message_id, author, subject, refs, reply_cert_pem, context_id, quote, date"
+            " FROM mails WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         return Mail(*row) if row else None
@@ -182,7 +187,8 @@ class State:
             )
             if final:
                 self._db.execute(
-                    "UPDATE mails SET closed_at = ? WHERE task_id = ? AND closed_at IS NULL",
+                    "UPDATE mails SET closed_at = ?, quote = NULL"
+                    " WHERE task_id = ? AND closed_at IS NULL",
                     (_now(), task_id),
                 )
             self._enqueue(task_id, mail, message_id, raw)
@@ -192,7 +198,8 @@ class State:
         with self._db:
             self._db.execute("BEGIN")
             self._db.execute(
-                "UPDATE mails SET closed_at = ? WHERE message_id = ? AND closed_at IS NULL",
+                "UPDATE mails SET closed_at = ?, quote = NULL"
+                " WHERE message_id = ? AND closed_at IS NULL",
                 (_now(), mail.message_id),
             )
             self._enqueue(None, mail, message_id, raw)

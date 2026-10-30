@@ -131,7 +131,7 @@ Message-ID, so each email reaches the agent once. Replies are at least once as w
 
 ### Limitations (v1)
 
-- Text only: attachments are ignored inbound, and replies are a single `text/plain` part.
+- Text only: attachments are ignored inbound, and replies are `multipart/alternative`: the agent's Markdown as `text/plain` and rendered to `text/html` (markdown-it-py, CommonMark with tables and strikethrough; raw HTML is escaped).
 - Every email starts a new A2A task in the thread's context; replies to an `input-required`
   question are not attached to the waiting task.
 - No revocation: neither inbound signatures nor the mailbox signature are checked against a CRL

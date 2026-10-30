@@ -8,6 +8,7 @@ from email.utils import formatdate, make_msgid
 from enum import Enum
 
 import html2text
+from markdown_it import MarkdownIt
 
 _MSG_ID = re.compile(r"<[^<>\s]+>")
 
@@ -136,10 +137,37 @@ def reply_message_id(agent_address: str) -> str:
     return make_msgid(domain=agent_address.rsplit("@", 1)[-1])
 
 
+# Agent text is untrusted: raw HTML is escaped and links keep markdown-it's safe schemes.
+_MARKDOWN = MarkdownIt("commonmark", {"html": False}).enable(["table", "strikethrough"])
+
+_HTML_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; line-height: 1.45; }}
+pre, code {{ font-family: ui-monospace, Menlo, monospace; background: #f4f4f4; }}
+pre {{ padding: 8px; overflow-x: auto; }}
+table {{ border-collapse: collapse; }}
+th, td {{ border: 1px solid #ccc; padding: 4px 8px; }}
+blockquote {{ margin-left: 0; padding-left: 10px; border-left: 3px solid #ccc; color: #555; }}
+</style></head>
+<body>
+{body}</body></html>
+"""
+
+
+def render_html(markdown: str) -> str:
+    return _HTML_PAGE.format(body=_MARKDOWN.render(markdown))
+
+
 def text_entity(text: str) -> bytes:
-    """A text/plain MIME entity (headers + body) ready to be signed."""
+    """A multipart/alternative MIME entity (headers + body) ready to be signed.
+
+    ``text`` is the agent's Markdown: sent as written in text/plain and rendered in text/html.
+    """
     part = EmailMessage()
     part.set_content(text, charset="utf-8", cte="quoted-printable")
+    part.add_alternative(render_html(text), subtype="html", charset="utf-8",
+                         cte="quoted-printable")
     del part["MIME-Version"]
     return part.as_bytes(policy=email.policy.SMTP)
 

@@ -11,6 +11,7 @@ import contextlib
 import email
 import email.policy
 import json
+import re
 import subprocess
 import tempfile
 import uuid
@@ -129,8 +130,13 @@ class FakeGateway:
                     self.send_errors -= 1
                     reply = {"type": "error", "id": header["id"], "message": "send_email failed"}
                 else:
-                    self.sent.append((header["to"], raw))
-                    reply = {"type": "sent", "id": header["id"]}
+                    # Like Cloudflare: the Message-ID header is replaced and reported back.
+                    message_id = f"<{uuid.uuid4().hex}@example.org>"
+                    head, sep, body = raw.partition(b"\r\n\r\n")
+                    head = re.sub(rb"(?im)^Message-ID:[^\r\n]*", f"Message-ID: {message_id}".encode(),
+                                  head)
+                    self.sent.append((header["to"], head + sep + body))
+                    reply = {"type": "sent", "id": header["id"], "messageId": message_id}
                 await ws.send(json.dumps(reply))
 
     async def deliver(self, raw: bytes) -> str:

@@ -46,7 +46,7 @@ class Sender:
             if reply.next_attempt_at > now:
                 break
             try:
-                await gateway.send(reply.id, reply.recipient, reply.raw)
+                delivered_id = await gateway.send(reply.id, reply.recipient, reply.raw)
             except Exception as e:
                 if not gateway.connected:
                     log.warning("reply %s to %s not sent: %s", reply.id, reply.recipient, e)
@@ -61,7 +61,7 @@ class Sender:
                             reply.id, reply.recipient, e, delay)
                 self._state.postpone_reply(reply.id, now + delay)
             else:
-                self._state.remove_reply(reply.id)
-                log.info("reply %s to %s sent", reply.id, reply.recipient)
+                self._state.remove_reply(reply.id, delivered_id=delivered_id)
+                log.info("reply %s to %s sent as %s", reply.id, reply.recipient, delivered_id)
         due = self._state.next_reply_due()
         return None if due is None else max(due - time.time(), 0)

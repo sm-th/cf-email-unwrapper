@@ -4,9 +4,52 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from dotenv import dotenv_values
 from urllib.parse import quote, urlsplit, urlunsplit
 
 _PEM_BLOCK = re.compile(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", re.S)
+
+
+def config_dir(env: dict[str, str]) -> Path:
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(
+        env.get("HOME") or os.path.expanduser("~"), ".config"
+    )
+    return Path(base) / "cf-email-unwrapper"
+
+
+def find_env_file(arg: str | None, env: dict[str, str]) -> Path | None:
+    """The env file to read: ``arg`` as a name or path, else the only ``*.env`` in the config dir.
+
+    Returns None when no argument is given and the environment already configures the service
+    (``AGENT_ADDRESS`` is set), so containers and exported shells keep working unchanged.
+    """
+    directory = config_dir(env)
+    if arg:
+        path = Path(arg).expanduser()
+        if path.suffix != ".env" and "/" not in arg:
+            path = directory / f"{arg}.env"
+        if not path.is_file():
+            raise ValueError(f"config file {path} not found")
+        return path
+    if env.get("AGENT_ADDRESS"):
+        return None
+    files = sorted(directory.glob("*.env"))
+    if len(files) == 1:
+        return files[0]
+    if not files:
+        raise ValueError(f"no configuration: set the environment or create {directory}/NAME.env")
+    names = ", ".join(f.stem for f in files)
+    raise ValueError(f"several config files in {directory} ({names}): pass the name as argument")
+
+
+def load_env(arg: str | None, env: dict[str, str]) -> dict[str, str]:
+    """The environment merged over the env file (variables already set win)."""
+    path = find_env_file(arg, env)
+    if path is None:
+        return dict(env)
+    values = {k: v for k, v in dotenv_values(path).items() if v is not None}
+    return {**values, **env}
 
 
 def read_pem(variable: str, path: str) -> str:

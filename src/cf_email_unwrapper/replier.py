@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 from a2a.types.a2a_pb2 import Message, Task, TaskState
 
-from .mail import compose_reply, text_entity
+from .mail import compose_reply, reply_message_id, text_entity
 from .smime import Smime
 from .state import Mail, State
 
@@ -75,41 +75,44 @@ class Replier:
             text = agent_text(task) or (
                 f"The agent finished without a text answer ({TaskState.Name(state)})."
             )
-            raw = await self.compose(mail, text, urgent=REPLY_STATES[state])
+            message_id, raw = await self.compose(mail, text, urgent=REPLY_STATES[state])
             self._state.record_reply(
                 task.id, state, final=state not in NON_FINAL_REPLY_STATES,
-                recipient=mail.author, raw=raw,
+                mail=mail, message_id=message_id, raw=raw,
             )
         self._queued(mail)
 
     async def reply_to_message(self, message: Message, mail: Mail) -> None:
         """Reply for an agent that answered SendMessage with a direct message."""
-        raw = await self.compose(mail, _message_text(message), urgent=False)
-        self._state.record_direct_reply(mail.message_id, recipient=mail.author, raw=raw)
+        message_id, raw = await self.compose(mail, _message_text(message), urgent=False)
+        self._state.record_direct_reply(mail=mail, message_id=message_id, raw=raw)
         self._queued(mail)
 
     def _queued(self, mail: Mail) -> None:
         log.info("reply to %s queued (%s)", mail.author, mail.message_id)
         self._on_queued()
 
-    async def compose(self, mail: Mail, text: str, *, urgent: bool) -> bytes:
-        raw = await asyncio.to_thread(self._compose, mail, text, urgent)
+    async def compose(self, mail: Mail, text: str, *, urgent: bool) -> tuple[str, bytes]:
+        """The reply's Message-ID and raw message."""
+        message_id = reply_message_id(self._agent_address)
+        raw = await asyncio.to_thread(self._compose, mail, message_id, text, urgent)
         if len(raw) > MAX_REPLY_BYTES:
             log.warning("reply to %s is too large to send; sending a notice", mail.author)
             notice = (
                 "The agent's answer is too large to be delivered by email "
                 f"({len(text.encode())} bytes of text)."
             )
-            raw = await asyncio.to_thread(self._compose, mail, notice, True)
-        return raw
+            raw = await asyncio.to_thread(self._compose, mail, message_id, notice, True)
+        return message_id, raw
 
-    def _compose(self, mail: Mail, text: str, urgent: bool) -> bytes:
+    def _compose(self, mail: Mail, message_id: str, text: str, urgent: bool) -> bytes:
         sealed = self._smime.seal(text_entity(text), mail.reply_cert_pem)
         return compose_reply(
             sealed,
             agent_address=self._agent_address,
             author=mail.author,
             subject=mail.subject,
+            message_id=message_id,
             parent_message_id=mail.message_id,
             parent_references=mail.references,
             urgent=urgent,

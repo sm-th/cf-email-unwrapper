@@ -1,5 +1,5 @@
-"""Local state: the email context of every mail handed to the agent, the replies made and the
-outbox of replies not yet confirmed by the gateway.
+"""Local state: the email context of every mail handed to the agent, the replies made (with their
+Message-IDs) and the outbox of replies not yet confirmed by the gateway.
 
 The agent only receives the text. Everything needed to reply lives here, keyed by the task id,
 so replies survive restarts and do not depend on what the agent keeps.
@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS mails (
     refs           TEXT NOT NULL,
     reply_cert_pem TEXT,
     received_at    TEXT NOT NULL,
-    closed_at      TEXT
+    closed_at      TEXT,
+    context_id     TEXT
 );
 CREATE TABLE IF NOT EXISTS replies (
     task_id TEXT NOT NULL,
@@ -28,6 +29,13 @@ CREATE TABLE IF NOT EXISTS replies (
     sent_at TEXT NOT NULL,
     PRIMARY KEY (task_id, state)
 );
+CREATE TABLE IF NOT EXISTS reply_mails (
+    message_id TEXT PRIMARY KEY,
+    task_id    TEXT,
+    context_id TEXT,
+    sent_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reply_mails_context ON reply_mails (context_id, sent_at);
 CREATE TABLE IF NOT EXISTS outbox (
     id              TEXT PRIMARY KEY,
     recipient       TEXT NOT NULL,
@@ -48,6 +56,15 @@ class Mail:
     subject: str
     references: str
     reply_cert_pem: str | None
+    context_id: str | None = None  # A2A context the mail was sent in
+
+
+@dataclass(frozen=True)
+class Parent:
+    """The mail an inbound mail answers, when it is one this unwrapper knows."""
+
+    task_id: str | None  # the task it belongs to (None for a direct agent reply)
+    latest_reply: bool  # our most recent reply in its thread
 
 
 @dataclass(frozen=True)
@@ -75,6 +92,9 @@ class State:
         self._db = sqlite3.connect(path, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(mails)")}
+        if "context_id" not in columns:  # state files from before the column existed
+            self._db.execute("ALTER TABLE mails ADD COLUMN context_id TEXT")
 
     def close(self) -> None:
         self._db.close()
@@ -90,13 +110,13 @@ class State:
     def record_mail(self, mail: Mail) -> None:
         """Store the context before the agent sees the mail; a retry overwrites it."""
         self._db.execute(
-            "INSERT INTO mails (message_id, author, subject, refs, reply_cert_pem, received_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO mails (message_id, author, subject, refs, reply_cert_pem, context_id,"
+            " received_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (message_id) DO UPDATE SET author = excluded.author,"
             " subject = excluded.subject, refs = excluded.refs,"
-            " reply_cert_pem = excluded.reply_cert_pem",
+            " reply_cert_pem = excluded.reply_cert_pem, context_id = excluded.context_id",
             (mail.message_id, mail.author, mail.subject, mail.references, mail.reply_cert_pem,
-             _now()),
+             mail.context_id, _now()),
         )
 
     def attach_task(self, message_id: str, task_id: str) -> None:
@@ -104,10 +124,28 @@ class State:
 
     def mail_for_task(self, task_id: str) -> Mail | None:
         row = self._db.execute(
-            "SELECT message_id, author, subject, refs, reply_cert_pem FROM mails WHERE task_id = ?",
+            "SELECT message_id, author, subject, refs, reply_cert_pem, context_id FROM mails"
+            " WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         return Mail(*row) if row else None
+
+    def parent(self, message_id: str) -> Parent | None:
+        """What ``message_id`` is to us: one of our replies, a mail we delivered, or unknown."""
+        row = self._db.execute(
+            "SELECT r.task_id, r.context_id IS NOT NULL AND r.message_id = ("
+            "  SELECT message_id FROM reply_mails WHERE context_id = r.context_id"
+            "  ORDER BY sent_at DESC, rowid DESC LIMIT 1)"
+            " FROM reply_mails r WHERE r.message_id = ?",
+            (message_id,),
+        ).fetchone()
+        if row:
+            return Parent(task_id=row[0], latest_reply=bool(row[1]))
+        row = self._db.execute(
+            "SELECT task_id FROM mails WHERE message_id = ? AND task_id IS NOT NULL",
+            (message_id,),
+        ).fetchone()
+        return Parent(task_id=row[0], latest_reply=False) if row else None
 
     def open_tasks(self) -> list[str]:
         """Tasks handed to the agent that have not received a final reply."""
@@ -124,7 +162,7 @@ class State:
         return row is not None
 
     def record_reply(
-        self, task_id: str, state: int, *, final: bool, recipient: str, raw: bytes
+        self, task_id: str, state: int, *, final: bool, mail: Mail, message_id: str, raw: bytes
     ) -> None:
         """Record the (task, state) answer and queue its reply in one transaction."""
         with self._db:
@@ -138,19 +176,25 @@ class State:
                     "UPDATE mails SET closed_at = ? WHERE task_id = ? AND closed_at IS NULL",
                     (_now(), task_id),
                 )
-            self._enqueue(recipient, raw)
+            self._enqueue(task_id, mail, message_id, raw)
 
-    def record_direct_reply(self, message_id: str, *, recipient: str, raw: bytes) -> None:
+    def record_direct_reply(self, *, mail: Mail, message_id: str, raw: bytes) -> None:
         """Close a mail the agent answered directly and queue the reply in one transaction."""
         with self._db:
             self._db.execute("BEGIN")
             self._db.execute(
                 "UPDATE mails SET closed_at = ? WHERE message_id = ? AND closed_at IS NULL",
-                (_now(), message_id),
+                (_now(), mail.message_id),
             )
-            self._enqueue(recipient, raw)
+            self._enqueue(None, mail, message_id, raw)
 
-    def _enqueue(self, recipient: str, raw: bytes) -> None:
+    def _enqueue(self, task_id: str | None, mail: Mail, message_id: str, raw: bytes) -> None:
+        self._db.execute(
+            "INSERT OR IGNORE INTO reply_mails (message_id, task_id, context_id, sent_at)"
+            " VALUES (?, ?, ?, ?)",
+            (message_id, task_id, mail.context_id, _now()),
+        )
+        recipient = mail.author
         now = datetime.now(UTC).timestamp()
         self._db.execute(
             "INSERT INTO outbox (id, recipient, raw, created_at, next_attempt_at)"

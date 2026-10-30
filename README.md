@@ -47,9 +47,11 @@ check. The agent only speaks plain A2A.
 5. Authenticated mail is sent to the agent with A2A `SendMessage` (non-blocking,
    `returnImmediately: true`) with a push notification config pointing to this service's push URL
    and the configured `PUSH_TOKEN`. The message text is the email's `text/plain` body, or its HTML
-   body converted to text; the message carries no email metadata. The email context needed for the
-   reply (author, subject, Message-ID, References, reply certificate) is stored in the local state
-   file under the task id.
+   body converted to text, with redundant quoted history trimmed (see
+   [Quoted history](#quoted-history)); the message carries no email metadata. When the mail
+   answers a known mail, the message sets `referenceTaskIds` to that mail's task. The email
+   context needed for the reply (author, subject, Message-ID, References, reply certificate,
+   `contextId`) is stored in the local state file under the task id.
 
    Once the agent has accepted the task, the mail is acknowledged. If the agent cannot be reached,
    the mail is not acknowledged and delivery is retried every 30 s until it succeeds; if the
@@ -78,13 +80,33 @@ fetches every task that has not reached a final reply (`completed`, `failed`, `r
 `canceled`) with `GetTask` and answers those that finished while it was down, so a notification
 lost during downtime does not lose the reply.
 
+### Quoted history
+
+The agent already has the conversation in its A2A context, so the quoted history a mail client
+appends is trimmed before the text is sent. The parent of a mail is the first Message-ID in its
+`In-Reply-To`: one of our replies (whose Message-IDs are stored with their task), a mail of the
+author we handed to the agent, or unknown. Its task, when known, goes into `referenceTaskIds`.
+
+Only the trailing quote block is touched: from the end, the run of quoted (`>`, `> >`, `>>` …) or
+blank lines, plus the unquoted line directly above it when it ends with `:` (the attribution, in
+any language, e.g. `On … wrote:` or `Am 30.10.2026 um 15:46 schrieb …:`). Quotes followed by new
+text (interleaved answers) and mails that are nothing but a quote are sent unchanged.
+
+- Parent is the most recent reply we sent in the thread: the block is removed.
+- Otherwise (an older reply of ours, the author's own mail, unknown): the attribution and the
+  first quote level stay, so the agent sees which mail is answered; deeper levels and their
+  attribution lines are removed.
+
+HTML-only mail is converted with html2text first, which renders `<blockquote>` as `>` lines.
+
 ### State
 
 One SQLite file per instance (`STATE_PATH`) holds the email context of every mail handed to the
-agent, the replies made and the outbox of replies not yet confirmed by the gateway. Keep it on
-persistent storage; losing it loses the replies for tasks still running, unsent replies and the
-protection against answering twice. Mail and reply rows are not pruned; outbox rows are deleted
-once sent or dropped.
+agent, the replies made (with their Message-ID, task and `contextId`) and the outbox of replies
+not yet confirmed by the gateway. Keep it on persistent storage; losing it loses the replies for
+tasks still running, unsent replies, the protection against answering twice and the quote
+trimming for replies to earlier mails. Mail and reply rows are not pruned; outbox rows are
+deleted once sent or dropped.
 
 ### Delivery guarantees
 

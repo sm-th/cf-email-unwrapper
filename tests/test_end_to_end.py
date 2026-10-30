@@ -460,3 +460,77 @@ async def test_signing_cert_for_another_address_is_refused(pki, gateway, agent, 
         assert len(gateway.mails) == 1 and agent.attempts == 0
     finally:
         await unwrapper.stop()
+
+
+async def ask(pki, gateway, agent, text: str, **headers: str) -> dict:
+    """Deliver an authenticated mail from the author; return the A2A message the agent got."""
+    sent = len(agent.requests)
+    raw = pki.seal(text, signer=pki.author_sign, extra_certs=[pki.author_enc],
+                   headers=mail_headers(Subject="Weather", **{k.replace("_", "-"): v
+                                                              for k, v in headers.items()}))
+    mail_id = await gateway.deliver(raw)
+    await eventually(lambda: mail_id in gateway.acked)
+    [request] = agent.requests[sent:]
+    return request["params"]["message"]
+
+
+async def answer(unwrapper, gateway, agent, task_id: str, text: str) -> str:
+    """Let the agent finish ``task_id``; return the Message-ID of the reply mail."""
+    sent = len(gateway.sent)
+    agent.complete(task_id, text)
+    resp = await unwrapper.push.post("/a2a/push", json={"task": {"id": task_id}},
+                                     headers={TOKEN_HEADER: PUSH_TOKEN})
+    assert resp.status_code == 200
+    await eventually(lambda: len(gateway.sent) == sent + 1)
+    return email.message_from_bytes(gateway.sent[-1][1])["Message-ID"]
+
+
+def quoting(new: str, quoted: str, nested: str) -> str:
+    """An Apple Mail style reply: new text, attribution, the quoted mail with its history."""
+    return (f"{new}\n\nAm 30.10.2026 um 15:46 schrieb Hermes <{BOT}>:\n\n> {quoted}\n>\n"
+            f"> > Am 30.10.2026 um 15:40 schrieb Author <{AUTHOR}>:\n> >\n> > {nested}\n")
+
+
+async def test_reply_to_the_latest_agent_reply_sends_only_the_new_text(
+    pki, gateway, agent, start
+):
+    unwrapper = await start()
+    first = await ask(pki, gateway, agent, "What is the weather?", Message_ID="<q1@example.com>")
+    assert "referenceTaskIds" not in first
+    reply = await answer(unwrapper, gateway, agent, "task-1", "Sunny.")
+    await unwrapper.stop()
+
+    await start()  # the reply's Message-ID is remembered across the restart
+    message = await ask(pki, gateway, agent, quoting("And tomorrow?", "Sunny.", "Weather?"),
+                        Message_ID="<q2@example.com>", In_Reply_To=reply,
+                        References=f"<q1@example.com> {reply}")
+    assert message["parts"] == [{"text": "And tomorrow?"}]
+    assert message["referenceTaskIds"] == ["task-1"]
+    assert message["contextId"] == first["contextId"]
+    assert "metadata" not in message
+
+
+async def test_reply_to_an_older_agent_reply_keeps_one_quote_level(pki, gateway, agent, start):
+    unwrapper = await start()
+    await ask(pki, gateway, agent, "What is the weather?", Message_ID="<q1@example.com>")
+    older = await answer(unwrapper, gateway, agent, "task-1", "Sunny.")
+    second = await ask(pki, gateway, agent, quoting("And tomorrow?", "Sunny.", "Weather?"),
+                       Message_ID="<q2@example.com>", In_Reply_To=older,
+                       References=f"<q1@example.com> {older}")
+    assert second["parts"] == [{"text": "And tomorrow?"}]
+    await answer(unwrapper, gateway, agent, "task-2", "Rain.")
+
+    message = await ask(pki, gateway, agent, quoting("Sunny where?", "Sunny.", "Weather?"),
+                        Message_ID="<q3@example.com>", In_Reply_To=older,
+                        References=f"<q1@example.com> {older}")
+    assert message["parts"] == [{"text": (
+        f"Sunny where?\n\nAm 30.10.2026 um 15:46 schrieb Hermes <{BOT}>:\n\n> Sunny."
+    )}]
+    assert message["referenceTaskIds"] == ["task-1"]
+
+    # Answering the author's own earlier mail references its task, quoting one level too.
+    own = await ask(pki, gateway, agent, quoting("Also humidity?", "And tomorrow?", "Sunny."),
+                    Message_ID="<q4@example.com>", In_Reply_To="<q2@example.com>",
+                    References=f"<q1@example.com> {older} <q2@example.com>")
+    assert own["referenceTaskIds"] == ["task-2"]
+    assert own["parts"][0]["text"].endswith("\n\n> And tomorrow?")

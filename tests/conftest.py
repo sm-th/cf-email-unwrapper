@@ -52,6 +52,7 @@ class Pki:
         self.mallory_sign = self._leaf("mallory-sign", self.other_ca, AUTHOR, sign_usage)
         self.mallory_enc = self._leaf("mallory-enc", self.other_ca, AUTHOR, "keyAgreement")
         self.stranger_enc = self._leaf("stranger-enc", self.ca, "stranger@example.com", "keyAgreement")
+        self.stranger_sign = self._leaf("stranger-sign", self.ca, "stranger@example.com", sign_usage)
 
     def _ca(self, name: str) -> Identity:
         openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
@@ -79,9 +80,10 @@ class Pki:
                 cwd=self.root)
         return Identity(self.root / f"{name}.pem", self.root / f"{name}.key")
 
-    def smime(self) -> Smime:
+    def smime(self, signing: Identity | None = None) -> Smime:
+        signing = signing or self.bot_sign
         return Smime(openssl=OPENSSL,
-                     signing_cert_pem=self.bot_sign.cert_pem, signing_key_pem=self.bot_sign.key_pem,
+                     signing_cert_pem=signing.cert_pem, signing_key_pem=signing.key_pem,
                      encryption_cert_pem=self.bot_enc.cert_pem,
                      encryption_key_pem=self.bot_enc.key_pem, ca_pem=self.ca.cert_pem)
 

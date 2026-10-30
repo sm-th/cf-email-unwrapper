@@ -17,14 +17,16 @@ author ──S/MIME──▶ Email Routing ─▶ gateway ─▶ mailbox Durable
 author ◀── send_email ◀── gateway ◀── signed (+ encrypted) reply
 ```
 
-The gateway has no keys and checks nothing; this service holds the bot key and performs every
-S/MIME check. The agent only speaks plain A2A.
+The gateway holds no secret and checks no mail; it only holds the public CA certificate to
+authenticate the mailbox connection. This service holds the bot keys and performs every S/MIME
+check. The agent only speaks plain A2A.
 
 ## What it does
 
-1. Connects to `<GATEWAY_URL>/mailbox/<AGENT_ADDRESS>` (see [Gateway protocol](#gateway-protocol))
-   and keeps the connection open, reconnecting with backoff (1 s doubling to 60 s). On every
-   connection the gateway sends all stored mail, oldest first, then new mail as it arrives.
+1. Connects to `<GATEWAY_URL>/mailbox/<AGENT_ADDRESS>` (see [Gateway protocol](#gateway-protocol)),
+   proving it owns the address with a signature by the bot signing key, and keeps the connection
+   open, reconnecting with backoff (1 s doubling to 60 s). On every connection the gateway sends
+   all stored mail, oldest first, then new mail as it arrives.
 2. Handles each mail in its own task, so a slow agent never blocks receiving.
 3. Opens the message with the OpenSSL CLI:
    - decrypts `application/pkcs7-mime` enveloped data with the bot encryption certificate and key
@@ -110,16 +112,35 @@ Message-ID, so each email reaches the agent once. Replies are at least once as w
 - Text only: attachments are ignored inbound, and replies are a single `text/plain` part.
 - Every email starts a new A2A task in the thread's context; replies to an `input-required`
   question are not attached to the waiting task.
+- No revocation: neither inbound signatures nor the mailbox signature are checked against a CRL
+  or OCSP.
 
 ## Gateway protocol
 
-`GET /mailbox/<percent-encoded address>` with `Authorization: Bearer <GATEWAY_TOKEN>`, upgraded to
-a WebSocket. The token is the lowercase hex HMAC-SHA256 of the lowercased address under the
-gateway's `GATEWAY_SECRET`:
+`GET /mailbox/<percent-encoded address>` with the header `X-Mailbox-Signature`, upgraded to a
+WebSocket. The header is the base64 of a DER CMS SignedData made with the bot signing key and
+certificate, detached over the UTF-8 challenge (the address lowercased and trimmed):
+
+```
+cf-email-gateway mailbox v1\n<address>\n
+```
+
+A fresh signature is made on every connection attempt, equivalent to:
 
 ```sh
-printf %s hermes@example.org | openssl dgst -sha256 -hmac "$GATEWAY_SECRET" -r | cut -d' ' -f1
+printf 'cf-email-gateway mailbox v1\n%s\n' hermes@example.org > challenge
+openssl cms -sign -binary -md sha256 -outform DER -in challenge \
+  -signer "$BOT_SIGNING_CERT_FILE" -inkey "$BOT_SIGNING_KEY_FILE" -out sig.der
+base64 < sig.der | tr -d '\n'
 ```
+
+The gateway accepts the connection only if the signature has exactly one signer and verifies over
+the challenge; the embedded signer certificate chains to the gateway's `CA_CERT`, is currently
+valid, has keyUsage `digitalSignature` and extendedKeyUsage `emailProtection`, and carries the
+address (SAN rfc822Name or subject emailAddress); and the signingTime is within five minutes of
+the gateway's clock. Otherwise it answers 401 and the unwrapper retries with backoff. There is no
+revocation check (the CA publishes no CRL): replacing a compromised bot signing key requires
+replacing the CA or waiting for the certificate to expire.
 
 Binary frames are a UTF-8 JSON header, a newline (`\n`) and raw bytes.
 
@@ -139,11 +160,10 @@ Environment variables only.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `GATEWAY_URL` | yes | | Gateway Worker URL, e.g. `https://cf-email-gateway.example.workers.dev` (`http`/`https`/`ws`/`wss`) |
-| `GATEWAY_TOKEN` | yes | | Mailbox token for `AGENT_ADDRESS` (see [Gateway protocol](#gateway-protocol)) |
+| `GATEWAY_URL` | yes | | Gateway Worker URL, e.g. `https://cf-email-gateway.example.workers.dev` (`http`/`https`/`ws`/`wss`); the mailbox connection is authenticated with the bot signing key (see [Gateway protocol](#gateway-protocol)) |
 | `AGENT_ADDRESS` | yes | | The agent's email address; selects the mailbox |
 | `BOT_SIGNING_KEY_FILE` | yes | | Path to the bot signing private key (unencrypted PEM) |
-| `BOT_SIGNING_CERT_FILE` | yes | | Path to the bot signing certificate (PEM) |
+| `BOT_SIGNING_CERT_FILE` | yes | | Path to the bot signing certificate (PEM); also opens the gateway mailbox, so it must be issued for `AGENT_ADDRESS` by the gateway's CA |
 | `BOT_ENCRYPTION_KEY_FILE` | yes | | Path to the bot encryption private key (unencrypted PEM) |
 | `BOT_ENCRYPTION_CERT_FILE` | yes | | Path to the bot encryption certificate (PEM); inbound mail is encrypted to it |
 | `CA_CERT_FILE` | yes | | Path to the trusted CA certificate(s) (PEM) |
@@ -191,9 +211,10 @@ uv run pytest
 ```
 
 The tests create a throwaway EC P-256 PKI (CA, author signing and encryption certificates, bot
-certificate, a second untrusted CA) with the configured OpenSSL, seal test mail with
+certificates, a second untrusted CA) with the configured OpenSSL, seal test mail with
 `openssl cms -sign | openssl cms -encrypt`, and run the whole loop against a local WebSocket server
-implementing the gateway mailbox protocol and a fake A2A agent.
+implementing the gateway mailbox protocol (including the `X-Mailbox-Signature` check, done with
+`openssl cms -verify`) and a fake A2A agent.
 
 ## Implementation notes
 

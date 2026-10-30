@@ -45,7 +45,6 @@ def mailbox_url(gateway_url: str, address: str) -> str:
 @dataclass(frozen=True)
 class Config:
     mailbox_url: str
-    gateway_token: str
     agent_address: str
     bot_signing_key_pem: str
     bot_signing_cert_pem: str
@@ -82,7 +81,6 @@ class Config:
         url_host = "127.0.0.1" if push_host in ("0.0.0.0", "::") else push_host
         return cls(
             mailbox_url=mailbox_url(required("GATEWAY_URL"), agent_address),
-            gateway_token=required("GATEWAY_TOKEN"),
             agent_address=agent_address,
             bot_signing_key_pem=read_pem("BOT_SIGNING_KEY_FILE", required("BOT_SIGNING_KEY_FILE")),
             bot_signing_cert_pem=read_pem("BOT_SIGNING_CERT_FILE", required("BOT_SIGNING_CERT_FILE")),

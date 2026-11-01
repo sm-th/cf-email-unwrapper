@@ -86,7 +86,11 @@ class Worker:
         if self._state.delivered(message_id):
             log.info("%s was already handed to the agent; skipping the redelivery", message_id)
             return
-        context = context_id(thread_root(outer, message_id))
+        # Which mail this one answers: one of our replies, or a mail of the author we delivered.
+        in_reply_to = message_ids(outer.get("In-Reply-To"))
+        parent = self._state.parent(in_reply_to[0]) if in_reply_to else None
+        # A known parent decides the thread: clients may send a truncated References.
+        context = (parent and parent.context_id) or context_id(thread_root(outer, message_id))
         text = extract_text(opened.content)
         mail = Mail(
             message_id=message_id,
@@ -98,9 +102,6 @@ class Worker:
             quote=trim_quotes(text, QuoteTrim.FULL),
             date=str(outer.get("Date", "")) or None,
         )
-        # Which mail this one answers: one of our replies, or a mail of the author we delivered.
-        in_reply_to = message_ids(outer.get("In-Reply-To"))
-        parent = self._state.parent(in_reply_to[0]) if in_reply_to else None
         self._state.record_mail(mail)
 
         # The agent already knows its latest reply; any other quoted mail tells it what is answered.

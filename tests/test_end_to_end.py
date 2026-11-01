@@ -560,3 +560,16 @@ async def test_reply_quotes_the_question_and_an_answer_to_it_drops_the_quote(
                         Message_ID="<q2@example.com>", In_Reply_To=reply_id,
                         References=f"<q1@example.com> {reply_id}")
     assert message["parts"] == [{"text": "And tomorrow?"}]
+
+
+async def test_thread_survives_a_references_header_cut_to_the_last_reply(pki, gateway, agent, start):
+    unwrapper = await start()
+    first = await ask(pki, gateway, agent, "One", Message_ID="<t1@example.com>")
+    reply = await answer(unwrapper, gateway, agent, "task-1", "Reply one")
+    # Like the iPhone mails seen in production: References holds only the reply's Message-ID.
+    second = await ask(pki, gateway, agent, "Two", Message_ID="<t2@example.com>",
+                       In_Reply_To=reply, References=reply)
+    reply = await answer(unwrapper, gateway, agent, "task-2", "Reply two")
+    third = await ask(pki, gateway, agent, "Three", Message_ID="<t3@example.com>",
+                      In_Reply_To=reply, References=reply)
+    assert first["contextId"] == second["contextId"] == third["contextId"]

@@ -122,9 +122,11 @@ Message-ID, so each email reaches the agent once. Replies are at least once as w
 
 ### Threads and ids
 
-- `contextId` = SHA-256 hex of `thread:<root Message-ID>`, where the root is the first Message-ID
-  in `References`, else `In-Reply-To`, else the message's own `Message-ID`. Every mail in a thread
-  therefore lands in the same agent conversation.
+- `contextId`: a mail whose `In-Reply-To` names a mail this guardian knows (one of its replies,
+  by generated or delivered Message-ID, or an author mail it delivered) joins that mail's context,
+  because clients may cut `References` down to the last message. Otherwise it is the SHA-256 hex of
+  `thread:<root Message-ID>`, where the root is the first Message-ID in `References`, else
+  `In-Reply-To`, else the message's own `Message-ID`.
 - `messageId` = SHA-256 hex of `message:<Message-ID>`, so a redelivered email keeps its A2A id.
 - Reply headers: `From` = agent address, `To` = author, `Subject: Re: <subject>` (RFC 2047 encoded
   when needed, no repeated `Re:`), `In-Reply-To: <parent Message-ID>`,

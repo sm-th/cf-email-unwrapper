@@ -67,6 +67,7 @@ class Parent:
 
     task_id: str | None  # the task it belongs to (None for a direct agent reply)
     latest_reply: bool  # our most recent reply in its thread
+    context_id: str | None = None  # the A2A context of its thread
 
 
 @dataclass(frozen=True)
@@ -150,16 +151,16 @@ class State:
             "SELECT r.task_id, r.context_id IS NOT NULL AND r.rowid = ("
             "  SELECT rowid FROM reply_mails WHERE context_id = r.context_id"
             "  ORDER BY sent_at DESC, rowid DESC LIMIT 1)"
-            " FROM reply_mails r WHERE r.message_id = ?1 OR r.delivered_id = ?1",
+            ", r.context_id FROM reply_mails r WHERE r.message_id = ?1 OR r.delivered_id = ?1",
             (message_id,),
         ).fetchone()
         if row:
-            return Parent(task_id=row[0], latest_reply=bool(row[1]))
+            return Parent(task_id=row[0], latest_reply=bool(row[1]), context_id=row[2])
         row = self._db.execute(
-            "SELECT task_id FROM mails WHERE message_id = ? AND task_id IS NOT NULL",
+            "SELECT task_id, context_id FROM mails WHERE message_id = ? AND task_id IS NOT NULL",
             (message_id,),
         ).fetchone()
-        return Parent(task_id=row[0], latest_reply=False) if row else None
+        return Parent(task_id=row[0], latest_reply=False, context_id=row[1]) if row else None
 
     def open_tasks(self) -> list[str]:
         """Tasks handed to the agent that have not received a final reply."""

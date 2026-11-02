@@ -24,7 +24,7 @@ from .mail import (
 )
 from .replier import REPLY_STATES, Replier
 from .smime import Opened, Rejected, Smime
-from .state import Mail, State
+from .state import Mail, Parent, State
 
 log = logging.getLogger(__name__)
 
@@ -46,8 +46,9 @@ class Worker:
         self._replier = replier
         self._state = state
         self._retry_delay = retry_delay
-        # Per Message-ID: serializes the delivered check and SendMessage, so duplicates reach the
-        # agent once, while different mails wait for the agent concurrently.
+        # Per A2A context: one mail of a thread is with the agent at a time (a session takes one
+        # message at a time; copies of a mail share its context, so they reach the agent once),
+        # while different threads wait for the agent concurrently.
         self._locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
     async def recover(self) -> None:
@@ -82,8 +83,13 @@ class Worker:
         )
         outer = email.message_from_bytes(raw, policy=email.policy.default)
         message_id = own_message_id(outer, raw)
-        async with self._exclusive(message_id):
-            await self._send_to_agent(outer, message_id, opened)
+        # Which mail this one answers: one of our replies, or a mail of the author we delivered.
+        in_reply_to = message_ids(outer.get("In-Reply-To"))
+        parent = self._state.parent(in_reply_to[0]) if in_reply_to else None
+        # A known parent decides the thread: clients may send a truncated References.
+        context = (parent and parent.context_id) or context_id(thread_root(outer, message_id))
+        async with self._exclusive(context):
+            await self._send_to_agent(outer, message_id, opened, parent, context)
 
     @contextlib.asynccontextmanager
     async def _exclusive(self, key: str) -> AsyncIterator[None]:
@@ -99,15 +105,11 @@ class Worker:
             else:
                 self._locks[key] = (lock, users - 1)
 
-    async def _send_to_agent(self, outer: EmailMessage, message_id: str, opened: Opened) -> None:
+    async def _send_to_agent(self, outer: EmailMessage, message_id: str, opened: Opened,
+                             parent: Parent | None, context: str) -> None:
         if self._state.delivered(message_id):
             log.info("%s was already handed to the agent; skipping the redelivery", message_id)
             return
-        # Which mail this one answers: one of our replies, or a mail of the author we delivered.
-        in_reply_to = message_ids(outer.get("In-Reply-To"))
-        parent = self._state.parent(in_reply_to[0]) if in_reply_to else None
-        # A known parent decides the thread: clients may send a truncated References.
-        context = (parent and parent.context_id) or context_id(thread_root(outer, message_id))
         text = extract_text(opened.content)
         mail = Mail(
             message_id=message_id,

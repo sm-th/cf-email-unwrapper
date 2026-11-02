@@ -31,7 +31,7 @@ async def main(cfg: Config) -> None:
         ca_pem=cfg.ca_cert_pem,
     )
     if cfg.a2a_url:
-        agent = AgentClient(cfg.a2a_url, cfg.a2a_token)
+        agent = AgentClient(cfg.a2a_url, cfg.a2a_token, send_timeout=cfg.a2a_send_timeout)
     else:
         agent = EchoAgent()
         log.warning("A2A_URL is not set: demo mode, every authenticated mail gets an echo reply")

@@ -18,8 +18,10 @@ from a2a.utils.constants import PROTOCOL_VERSION_CURRENT, VERSION_HEADER
 
 
 class AgentClient:
-    def __init__(self, url: str, token: str, http: httpx.AsyncClient | None = None):
-        http = http or httpx.AsyncClient(timeout=60)
+    def __init__(self, url: str, token: str, http: httpx.AsyncClient | None = None, *,
+                 send_timeout: float = 60):
+        # Some agents (Hermes) ignore returnImmediately and answer SendMessage only when done.
+        http = http or httpx.AsyncClient(timeout=httpx.Timeout(60, read=send_timeout))
         http.headers["Authorization"] = f"Bearer {token}"
         http.headers.setdefault(VERSION_HEADER, PROTOCOL_VERSION_CURRENT)
         # The endpoint is configured directly, so no agent card discovery is needed.

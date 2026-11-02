@@ -158,8 +158,11 @@ class FakeAgent:
         self.requests: list[dict] = []
         self.attempts = 0
         self.unavailable = False
+        # Like Hermes: SendMessage for these texts stays open until the event is set, then
+        # returns the finished task.
+        self.hold: dict[str, asyncio.Event] = {}
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    async def handler(self, request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer a2a-token"
         self.attempts += 1
         if self.unavailable:
@@ -176,6 +179,10 @@ class FakeAgent:
                 "status": {"state": "TASK_STATE_SUBMITTED"},
                 "history": [message],
             }
+            text = message["parts"][0]["text"]
+            if text in self.hold:
+                await self.hold[text].wait()
+                self.complete(task_id, f"Answer to {text}")
             result = {"task": self.tasks[task_id]}
         elif rpc["method"] == "GetTask":
             result = self.tasks[params["id"]]
@@ -573,3 +580,23 @@ async def test_thread_survives_a_references_header_cut_to_the_last_reply(pki, ga
     third = await ask(pki, gateway, agent, "Three", Message_ID="<t3@example.com>",
                       In_Reply_To=reply, References=reply)
     assert first["contextId"] == second["contextId"] == third["contextId"]
+
+
+async def test_agent_holding_send_message_gets_each_mail_once_and_others_meanwhile(
+    pki, gateway, agent, start
+):
+    unwrapper = await start()
+    agent.hold["Slow"] = asyncio.Event()
+    slow = await gateway.deliver(pki.seal("Slow", signer=pki.author_sign, headers=mail_headers()))
+    await eventually(lambda: agent.methods() == ["SendMessage"])
+    # Another mail is handed over and answered while the first SendMessage is still open.
+    await ask(pki, gateway, agent, "Fast", Message_ID="<fast@example.com>")
+    await answer(unwrapper, gateway, agent, "task-2", "Quick.")
+    assert slow not in gateway.acked
+
+    await asyncio.sleep(0.2)  # longer than the retry delay: an open call is not retried
+    agent.hold["Slow"].set()
+    await eventually(lambda: slow in gateway.acked and len(gateway.sent) == 2)
+    assert [r["params"]["message"]["parts"][0]["text"] for r in agent.requests
+            if r["method"] == "SendMessage"] == ["Slow", "Fast"]
+    assert b"Answer to Slow" in pki.open_reply(gateway.sent[-1][1], recipient=None)

@@ -199,6 +199,7 @@ Environment variables only.
 | `ALLOWED_SENDERS` | yes | | Comma or whitespace separated author addresses |
 | `A2A_URL` | no | | Agent JSON-RPC endpoint (e.g. `http://127.0.0.1:8000/`); unset = demo mode (echo replies) |
 | `A2A_TOKEN` | with `A2A_URL` | | Bearer token for the agent |
+| `A2A_SEND_TIMEOUT` | no | `15m` | How long `SendMessage` may stay open. Agents that ignore `returnImmediately` (Hermes) answer it only when done: set this above the agent's reply timeout (`A2A_REPLY_TIMEOUT` for Hermes). A timeout is retried and may make the agent run the mail again |
 | `PUSH_HOST` | no | `127.0.0.1` | Bind address of the push endpoint |
 | `PUSH_PORT` | no | `8090` | Port of the push endpoint |
 | `PUSH_URL` | no | `http://<PUSH_HOST>:<PUSH_PORT>/a2a/push` (`127.0.0.1` when bound to a wildcard) | URL the agent posts notifications to |

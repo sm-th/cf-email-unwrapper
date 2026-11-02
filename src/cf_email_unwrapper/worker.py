@@ -1,9 +1,11 @@
 """Inbound path: gateway mail frame -> S/MIME -> A2A SendMessage."""
 
 import asyncio
+import contextlib
 import email
 import email.policy
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 
@@ -44,8 +46,9 @@ class Worker:
         self._replier = replier
         self._state = state
         self._retry_delay = retry_delay
-        # Serializes the Message-ID check and SendMessage, so duplicates reach the agent once.
-        self._deliver_lock = asyncio.Lock()
+        # Per Message-ID: serializes the delivered check and SendMessage, so duplicates reach the
+        # agent once, while different mails wait for the agent concurrently.
+        self._locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
     async def recover(self) -> None:
         """Answer tasks that finished while no notification could reach this process."""
@@ -79,8 +82,22 @@ class Worker:
         )
         outer = email.message_from_bytes(raw, policy=email.policy.default)
         message_id = own_message_id(outer, raw)
-        async with self._deliver_lock:
+        async with self._exclusive(message_id):
             await self._send_to_agent(outer, message_id, opened)
+
+    @contextlib.asynccontextmanager
+    async def _exclusive(self, key: str) -> AsyncIterator[None]:
+        lock, users = self._locks.get(key, (asyncio.Lock(), 0))
+        self._locks[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, users = self._locks[key]
+            if users == 1:
+                del self._locks[key]
+            else:
+                self._locks[key] = (lock, users - 1)
 
     async def _send_to_agent(self, outer: EmailMessage, message_id: str, opened: Opened) -> None:
         if self._state.delivered(message_id):

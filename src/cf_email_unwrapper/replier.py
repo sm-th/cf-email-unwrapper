@@ -70,7 +70,10 @@ class Replier:
                 return
             mail = self._state.mail_for_task(task.id)
             if mail is None:
-                log.error("task %s was not submitted by this unwrapper; cannot reply", task.id)
+                # Also seen when the agent pushes before its SendMessage answer arrived; the
+                # reply is then made from that answer.
+                log.info("task %s is not (yet) known here; no reply from this notification",
+                         task.id)
                 return
             text = agent_text(task) or (
                 f"The agent finished without a text answer ({TaskState.Name(state)})."

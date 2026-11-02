@@ -97,6 +97,7 @@ class Config:
     allowed_senders: frozenset[str]
     a2a_url: str | None  # None: demo mode, the guardian answers with an echo itself
     a2a_token: str | None
+    a2a_send_timeout: float  # how long SendMessage may stay open (some agents hold it until done)
     push_host: str
     push_port: int
     push_url: str
@@ -136,6 +137,7 @@ class Config:
             ),
             a2a_url=a2a_url,
             a2a_token=required("A2A_TOKEN") if a2a_url else None,
+            a2a_send_timeout=parse_duration(env.get("A2A_SEND_TIMEOUT") or "15m"),
             push_host=push_host,
             push_port=push_port,
             push_url=env.get("PUSH_URL") or f"http://{url_host}:{push_port}/a2a/push",

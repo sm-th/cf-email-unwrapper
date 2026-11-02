@@ -600,3 +600,24 @@ async def test_agent_holding_send_message_gets_each_mail_once_and_others_meanwhi
     assert [r["params"]["message"]["parts"][0]["text"] for r in agent.requests
             if r["method"] == "SendMessage"] == ["Slow", "Fast"]
     assert b"Answer to Slow" in pki.open_reply(gateway.sent[-1][1], recipient=None)
+
+
+async def test_mails_of_one_thread_reach_the_agent_one_at_a_time(pki, gateway, agent, start):
+    unwrapper = await start()
+    agent.hold["First"] = asyncio.Event()
+    await gateway.deliver(pki.seal("First", signer=pki.author_sign,
+                                   headers=mail_headers(**{"Message-ID": "<a1@example.com>"})))
+    await eventually(lambda: agent.methods() == ["SendMessage"])
+    # The author follows up in the same thread before the agent answered.
+    await gateway.deliver(pki.seal("Second", signer=pki.author_sign, headers=mail_headers(
+        **{"Message-ID": "<a2@example.com>", "In-Reply-To": "<a1@example.com>",
+           "References": "<a1@example.com>"})))
+    # Another thread is not held up.
+    await ask(pki, gateway, agent, "Other", Message_ID="<b1@example.com>")
+    texts = lambda: [r["params"]["message"]["parts"][0]["text"] for r in agent.requests  # noqa: E731
+                     if r["method"] == "SendMessage"]
+    await asyncio.sleep(0.2)
+    assert texts() == ["First", "Other"]
+
+    agent.hold["First"].set()
+    await eventually(lambda: texts() == ["First", "Other", "Second"])
